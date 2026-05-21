@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+langchain-core
+langchain-google-genai
+langsmith
+openalgo
+pandas
+numpy
+python-dotenv
+pydantic
+sse-starlette
+httpx
+certifi

@@ -45,6 +45,9 @@ export default function AgentPipeline({ agentStates, startTime }) {
                   <span className="text-xs text-yellow-400">running</span>
                 </span>
               )}
+              {state === 'skipped' && (
+                <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">skipped</span>
+              )}
               {state === 'done' && (
                 <span className="flex items-center gap-1.5">
                   <span className="text-green-400 text-sm">✓</span>

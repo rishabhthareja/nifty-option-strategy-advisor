@@ -19,14 +19,22 @@ from agents.options_chain import options_chain_agent
 from agents.oi_analysis import oi_analysis_agent
 from agents.greeks import greeks_agent
 from agents.strategy import strategy_agent
+from services.entry_guards import evaluator_skipped_sse_payload, should_skip_evaluator
 from agents.evaluator import evaluator_agent
 from models.strategy import OrderDetails, ExecutionResult
 from services.openalgo_client import OpenAlgoService
+from services.live_market_cache import get_cached_live_data, start_background_refresh
 from services.error_messages import format_sse_error
 from services.session_logger import SessionLogger
 from config import ENABLE_LIVE_ORDERS
 
 app = FastAPI(title="Nifty Options Advisor", version="1.0.0")
+
+
+@app.on_event("startup")
+def _startup_live_cache():
+    start_background_refresh()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -127,9 +135,7 @@ def deep_health():
 
 @app.get("/live-data")
 def live_data():
-    svc = OpenAlgoService()
-    data = svc.get_market_data()
-    return data
+    return get_cached_live_data()
 
 
 @app.get("/analyse/stream")
@@ -211,7 +217,9 @@ async def analyse_stream():
             # ── Greeks ───────────────────────────────────────────────────────
             yield await _sse_event({"agent": "greeks", "status": "running"})
             t0 = time.time()
-            greeks = await asyncio.get_event_loop().run_in_executor(None, greeks_agent, chain, market, oi)
+            greeks = await asyncio.get_event_loop().run_in_executor(
+                None, greeks_agent, chain, market, oi, technical
+            )
             elapsed = time.time() - t0
             logger.set_timing("greeks", elapsed)
             logger.log("greeks", _safe_dict(greeks), step=5)
@@ -220,9 +228,10 @@ async def analyse_stream():
 
             # ── Strategy ─────────────────────────────────────────────────────
             yield await _sse_event({"agent": "strategy", "status": "running"})
+            funds = OpenAlgoService().get_funds()
             t0 = time.time()
             strategy = await asyncio.get_event_loop().run_in_executor(
-                None, strategy_agent, market, technical, oi, greeks, chain
+                None, strategy_agent, market, technical, oi, greeks, chain, funds
             )
             elapsed = time.time() - t0
             logger.set_timing("strategy", elapsed)
@@ -232,17 +241,29 @@ async def analyse_stream():
             yield await _sse_event({"agent": "strategy", "status": "done", "data": _safe_dict(strategy), "elapsed": round(elapsed, 2)})
 
             # ── Evaluator ─────────────────────────────────────────────────────
-            yield await _sse_event({"agent": "evaluator", "status": "running"})
-            t0 = time.time()
-            evaluation = await asyncio.get_event_loop().run_in_executor(
-                None, evaluator_agent, market, technical, oi, greeks, strategy, run_id, chain
-            )
-            elapsed = time.time() - t0
-            logger.set_timing("evaluator", elapsed)
-            logger.log("evaluator", _safe_dict(evaluation), step=7)
-            results["evaluator"] = _safe_dict(evaluation)
-            _pending_evaluation[run_id] = evaluation
-            yield await _sse_event({"agent": "evaluator", "status": "done", "data": _safe_dict(evaluation), "elapsed": round(elapsed, 2)})
+            evaluation = None
+            if should_skip_evaluator(strategy):
+                skipped = evaluator_skipped_sse_payload("pre_flight")
+                logger.log("evaluator", skipped, step=7)
+                results["evaluator"] = skipped
+                yield await _sse_event(skipped)
+            else:
+                yield await _sse_event({"agent": "evaluator", "status": "running"})
+                t0 = time.time()
+                evaluation = await asyncio.get_event_loop().run_in_executor(
+                    None, evaluator_agent, market, technical, oi, greeks, strategy, run_id, chain
+                )
+                elapsed = time.time() - t0
+                logger.set_timing("evaluator", elapsed)
+                logger.log("evaluator", _safe_dict(evaluation), step=7)
+                results["evaluator"] = _safe_dict(evaluation)
+                _pending_evaluation[run_id] = evaluation
+                yield await _sse_event({
+                    "agent": "evaluator",
+                    "status": "done",
+                    "data": _safe_dict(evaluation),
+                    "elapsed": round(elapsed, 2),
+                })
 
             # ── Final ────────────────────────────────────────────────────────
             logger.save_master()
@@ -256,35 +277,37 @@ async def analyse_stream():
                 expiry_str = nifty_weekly_expiry_for_session()
 
             from models.strategy import OrderLeg
-            from config import LOT_SIZE, NUM_LOTS
+            from services.chain_utils import order_quantity
 
+            leg_qty = order_quantity(chain)
             legs = []
             if strategy.strategy != "WAIT":
                 if strategy.sell_put_strike:
                     legs.append(OrderLeg(
                         symbol=f"NIFTY{expiry_str}{strategy.sell_put_strike}PE",
-                        action="SELL", quantity=LOT_SIZE * NUM_LOTS,
+                        action="SELL", quantity=leg_qty,
                         premium=strategy.sell_put_premium or 0, leg="sell_put"
                     ))
                 if strategy.buy_put_strike:
                     legs.append(OrderLeg(
                         symbol=f"NIFTY{expiry_str}{strategy.buy_put_strike}PE",
-                        action="BUY", quantity=LOT_SIZE * NUM_LOTS,
+                        action="BUY", quantity=leg_qty,
                         premium=strategy.buy_put_premium or 0, leg="buy_put"
                     ))
                 if strategy.sell_call_strike:
                     legs.append(OrderLeg(
                         symbol=f"NIFTY{expiry_str}{strategy.sell_call_strike}CE",
-                        action="SELL", quantity=LOT_SIZE * NUM_LOTS,
+                        action="SELL", quantity=leg_qty,
                         premium=strategy.sell_call_premium or 0, leg="sell_call"
                     ))
                 if strategy.buy_call_strike:
                     legs.append(OrderLeg(
                         symbol=f"NIFTY{expiry_str}{strategy.buy_call_strike}CE",
-                        action="BUY", quantity=LOT_SIZE * NUM_LOTS,
+                        action="BUY", quantity=leg_qty,
                         premium=strategy.buy_call_premium or 0, leg="buy_call"
                     ))
 
+            quality_score = evaluation.quality_score if evaluation is not None else 0.0
             order_details = OrderDetails(
                 strategy=strategy.strategy,
                 expiry=expiry_str,
@@ -294,7 +317,7 @@ async def analyse_stream():
                 max_loss_actual=strategy.max_loss or 0,
                 lower_breakeven=strategy.lower_breakeven,
                 upper_breakeven=strategy.upper_breakeven,
-                quality_score=evaluation.quality_score,
+                quality_score=quality_score,
             )
             _pending_order_details[run_id] = order_details
 
@@ -302,7 +325,7 @@ async def analyse_stream():
                 "agent": "complete",
                 "run_id": run_id,
                 "strategy": _safe_dict(strategy),
-                "evaluation": _safe_dict(evaluation),
+                "evaluation": _safe_dict(evaluation) if evaluation is not None else results.get("evaluator"),
                 "order_details": _safe_dict(order_details),
             })
 

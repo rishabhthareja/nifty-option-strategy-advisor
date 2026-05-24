@@ -75,7 +75,7 @@ def intraday_context(market) -> str:
 
     lines = [
         f"- Spot vs today open: {from_open:+.1f} pts ({'above' if from_open > 0 else 'below' if from_open < 0 else 'at'} open)",
-        f"- Today range: {l:.0f} – {h:.0f} ({day_range:.0f} pts) | Spot {pos_in_range:.0f}% up from day's low",
+        f"- Today range: {l:.0f} – {h:.0f} ({day_range:.0f} pts) | Spot at {pos_in_range:.0f}% of range (0=low, 100=high)",
     ]
     if day_range > 0:
         used = abs(from_open) / day_range * 100 if day_range else 0
@@ -121,42 +121,70 @@ def entry_timing_block(expiry: str | None) -> str:
     return "- Entry window: OK — regular session (prefer entries 09:45–14:30 IST)."
 
 
-def dual_expiry_summary(service, spot: float, primary_expiry: str) -> str:
-    """Compare primary (often 0 DTE) vs next weekly for new trades."""
-    from services.expiry_utils import nifty_next_weekly_expiry, compact_expiry, nifty_weekly_expiry_for_session
+def weekly_expiry_context_block(
+    service,
+    spot: float,
+    chain_expiry: str,
+    session_calendar_expiry: str | None = None,
+) -> str:
+    """Always-on weekly expiry context: calendar vs active chain (live analysis)."""
+    from config import MIN_ENTRY_DTE, PREFERRED_DTE_MAX, PREFERRED_DTE_MIN
+    from services.expiry_utils import (
+        nifty_next_weekly_expiry,
+        nifty_weekly_expiry_for_session,
+        parse_compact_expiry,
+    )
 
     now = ist_now()
-    today_primary = nifty_weekly_expiry_for_session(now)
+    session = session_calendar_expiry or nifty_weekly_expiry_for_session(now)
     next_exp = nifty_next_weekly_expiry(now)
-
-    if primary_expiry == next_exp or parse_compact_expiry(primary_expiry) == parse_compact_expiry(next_exp):
-        return ""
+    chain_dte = days_to_expiry(chain_expiry, now)
+    session_dte = days_to_expiry(session, now)
+    rolled = (
+        parse_compact_expiry(session) is not None
+        and parse_compact_expiry(chain_expiry) is not None
+        and parse_compact_expiry(session) != parse_compact_expiry(chain_expiry)
+    )
 
     lines = [
-        "NEXT EXPIRY (for safer new positions on weekly expiry day):",
-        f"- Primary chain expiry: {primary_expiry} (DTE {days_to_expiry(primary_expiry, now)})",
-        f"- Next weekly expiry: {next_exp} (DTE {days_to_expiry(next_exp, now)})",
-        "- RECOMMENDATION: On 0 DTE, prefer structuring new short-premium trades on NEXT expiry unless explicitly scalping expiry.",
+        "WEEKLY ENTRY EXPIRY (live):",
+        f"- Session calendar expiry: {session} (DTE {session_dte if session_dte is not None else 'unknown'})",
+        f"- Active analysis chain expiry: {chain_expiry} (DTE {chain_dte if chain_dte is not None else 'unknown'})",
+        (
+            f"- Policy: new weekly-style entries require DTE >= {MIN_ENTRY_DTE}; "
+            f"preferred {PREFERRED_DTE_MIN}-{PREFERRED_DTE_MAX} DTE."
+        ),
     ]
-
-    try:
-        nchain = service.get_options_chain(expiry=next_exp)
-        if nchain is None or getattr(nchain, "empty", True):
-            lines.append("- Next-expiry chain: unavailable")
-            return "\n".join(lines)
-
-        atm = int(round(spot / STRIKE_INTERVAL) * STRIKE_INTERVAL)
-        half_move, straddle, _ = straddle_expected_move(nchain, atm, spot)
+    if rolled:
         lines.append(
-            f"- Next expiry ATM ({atm}) straddle ≈ {straddle:.1f} pts "
-            f"(implied ±{half_move:.0f} pts to expiry) [LIVE chain]"
+            "- Rolled forward: analysis chain is not the calendar expiry because the session week is too close."
         )
-        ne = getattr(nchain, "attrs", {}).get("expiry", next_exp)
-        lines.append(f"- Next expiry chain source: {getattr(nchain, 'attrs', {}).get('source', 'unknown')} ({ne})")
-    except Exception as e:
-        lines.append(f"- Next-expiry chain: load failed ({e})")
+    else:
+        lines.append("- Active chain matches calendar weekly target (no roll).")
+
+    other = next_exp
+    if parse_compact_expiry(other) != parse_compact_expiry(chain_expiry):
+        try:
+            nchain = service.get_options_chain(expiry=other)
+            if nchain is not None and not getattr(nchain, "empty", True):
+                atm = int(round(spot / STRIKE_INTERVAL) * STRIKE_INTERVAL)
+                half_move, straddle, _ = straddle_expected_move(nchain, atm, spot)
+                ne = getattr(nchain, "attrs", {}).get("expiry", other)
+                lines.append(
+                    f"- Alternate weekly {ne}: ATM straddle ≈ {straddle:.1f} pts "
+                    f"(implied ±{half_move:.0f} pts) [LIVE]"
+                )
+            else:
+                lines.append(f"- Alternate weekly {other}: chain unavailable")
+        except Exception as e:
+            lines.append(f"- Alternate weekly {other}: load failed ({e})")
 
     return "\n".join(lines)
+
+
+def dual_expiry_summary(service, spot: float, primary_expiry: str) -> str:
+    """Backward-compatible alias for weekly_expiry_context_block."""
+    return weekly_expiry_context_block(service, spot, primary_expiry)
 
 
 def reliability_legend() -> str:

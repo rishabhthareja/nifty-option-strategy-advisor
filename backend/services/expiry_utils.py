@@ -88,15 +88,67 @@ def nifty_weekly_expiry_for_session(now: datetime | None = None) -> str:
     return compact_expiry(nifty_weekly_expiry_on_or_after(today))
 
 
-def resolve_chain_expiry(service) -> str:
-    """Pick chain expiry: today's Tue weekly when applicable, else broker nearest."""
-    preferred = nifty_weekly_expiry_for_session()
+def resolve_weekly_entry_expiry(now: datetime | None = None) -> str:
+    """
+    Target expiry for new weekly-style entries.
+    Uses session calendar weekly, but rolls to next Tuesday when DTE < MIN_ENTRY_DTE.
+    """
+    from config import MIN_ENTRY_DTE
+
+    now = now or ist_now()
+    session = nifty_weekly_expiry_for_session(now)
+    dte = days_to_expiry(session, now)
+    if dte is not None and dte < MIN_ENTRY_DTE:
+        return nifty_next_weekly_expiry(now)
+    return session
+
+
+def is_below_min_entry_dte(expiry: str | None, now: datetime | None = None) -> bool:
+    from config import MIN_ENTRY_DTE
+
+    dte = days_to_expiry(expiry, now)
+    return dte is not None and dte < MIN_ENTRY_DTE
+
+
+def _load_chain_expiry(service, expiry: str) -> str | None:
     try:
-        chain = service.get_options_chain(expiry=preferred)
+        chain = service.get_options_chain(expiry=expiry)
         if chain is not None and not getattr(chain, "empty", True):
-            return getattr(chain, "attrs", {}).get("expiry") or preferred
+            return str(getattr(chain, "attrs", {}).get("expiry") or expiry)
     except Exception:
         pass
+    return None
+
+
+def resolve_chain_expiry(service, now: datetime | None = None) -> str:
+    """
+    Pick chain expiry for analysis: weekly entry target (DTE >= MIN_ENTRY_DTE) when possible.
+    Falls back to broker nearest if preferred series is unavailable.
+    """
+    from config import MIN_ENTRY_DTE
+
+    now = now or ist_now()
+    preferred = resolve_weekly_entry_expiry(now)
+    candidates: list[str] = [preferred]
+    session = nifty_weekly_expiry_for_session(now)
+    next_week = nifty_next_weekly_expiry(now)
+    for exp in (session, next_week):
+        if exp not in candidates:
+            candidates.append(exp)
+
+    best_low_dte: str | None = None
+    for exp in candidates:
+        resolved = _load_chain_expiry(service, exp)
+        if not resolved:
+            continue
+        dte = days_to_expiry(resolved, now)
+        if dte is not None and dte >= MIN_ENTRY_DTE:
+            return resolved
+        if best_low_dte is None:
+            best_low_dte = resolved
+
+    if best_low_dte:
+        return best_low_dte
 
     nearest = service._next_available_expiry()
     if nearest:
@@ -106,17 +158,39 @@ def resolve_chain_expiry(service) -> str:
 
 def expiry_context_block(expiry: str | None, now: datetime | None = None) -> str:
     """Factual expiry lines for LLM prompts."""
+    from config import MIN_ENTRY_DTE, PREFERRED_DTE_MAX, PREFERRED_DTE_MIN
+
     now = now or ist_now()
     dte = days_to_expiry(expiry, now)
     exp_date = parse_compact_expiry(expiry)
     exp_label = exp_date.isoformat() if exp_date else "unknown"
     on_day = is_expiry_day(expiry, now)
+    session_cal = nifty_weekly_expiry_for_session(now)
+    session_dte = days_to_expiry(session_cal, now)
+    rolled = (
+        parse_compact_expiry(session_cal) is not None
+        and parse_compact_expiry(expiry) is not None
+        and parse_compact_expiry(session_cal) != parse_compact_expiry(expiry)
+    )
 
     lines = [
         f"- Option expiry (chain): {expiry or 'unknown'} ({exp_label})",
         f"- Days to expiry (DTE): {dte if dte is not None else 'unknown'}",
         f"- Is expiry day (0 DTE): {'YES' if on_day else 'NO'}",
+        (
+            f"- Weekly entry policy: require DTE >= {MIN_ENTRY_DTE} for new trades; "
+            f"preferred hold window {PREFERRED_DTE_MIN}-{PREFERRED_DTE_MAX} DTE."
+        ),
+        f"- Session calendar expiry: {session_cal} (DTE {session_dte if session_dte is not None else 'unknown'})",
     ]
+    if rolled:
+        lines.append(
+            "- Chain rolled to next weekly: calendar expiry was too close for a new weekly hold."
+        )
+    if dte is not None and dte < MIN_ENTRY_DTE:
+        lines.append(
+            f"- WARNING: Loaded chain DTE ({dte}) is below minimum {MIN_ENTRY_DTE} — system should WAIT on new entries."
+        )
     if on_day:
         lines.append(
             "- EXPIRY DAY RULES: Elevated gamma/pin risk; prefer wider iron condor (different short strikes) "

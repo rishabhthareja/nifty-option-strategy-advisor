@@ -26,6 +26,8 @@ export default function App() {
 
   const handleStart = () => {
     if (isRunning) return
+    esRef.current?.close()
+    esRef.current = null
     setIsRunning(true)
     setIsComplete(false)
     setError(null)
@@ -48,10 +50,14 @@ export default function App() {
 
       if (agent === 'complete') {
         setRunId(run_id)
+        const evalPayload =
+          evaluation?.status === 'skipped'
+            ? { status: 'skipped', reason: evaluation.reason || 'pre_flight' }
+            : evaluation
         setAgentData(prev => ({
           ...prev,
           strategy: strategy,
-          evaluator: evaluation,
+          evaluator: evalPayload,
         }))
         setIsRunning(false)
         setIsComplete(true)
@@ -61,6 +67,16 @@ export default function App() {
 
       if (status === 'running') {
         setAgentStates(prev => ({ ...prev, [agent]: 'running' }))
+      }
+
+      if (status === 'skipped') {
+        setAgentStates(prev => ({ ...prev, [agent]: 'skipped' }))
+        if (agent === 'evaluator') {
+          setAgentData(prev => ({
+            ...prev,
+            evaluator: { status: 'skipped', reason: event.reason || 'pre_flight' },
+          }))
+        }
       }
 
       if (status === 'done') {

@@ -163,15 +163,19 @@ def build_evaluator_digest_block(market, technical, oi, greeks, chain) -> str:
         reliability_legend,
     )
     from services.openalgo_client import OpenAlgoService
-    from services.market_metrics import dual_expiry_summary
+    from services.market_metrics import weekly_expiry_context_block
 
     mq, cq, issues = data_integrity_status(market, chain)
     expiry = getattr(chain, "attrs", {}).get("expiry", "") if chain is not None else ""
     ist_label, phase = session_phase_with_expiry(expiry)
     ch_src = getattr(chain, "attrs", {}).get("source", "") if chain is not None else ""
+    attrs = getattr(chain, "attrs", {}) or {} if chain is not None else {}
+    session_cal = attrs.get("session_calendar_expiry", "")
     dual = ""
     if mq and cq and expiry:
-        dual = dual_expiry_summary(OpenAlgoService(), market.nifty_spot, expiry)
+        dual = weekly_expiry_context_block(
+            OpenAlgoService(), market.nifty_spot, expiry, session_cal or None
+        )
 
     move_note = (
         f"implied move ±{greeks.expected_daily_move:.0f} pts ({greeks.expected_move_method})"
@@ -192,12 +196,13 @@ def build_evaluator_digest_block(market, technical, oi, greeks, chain) -> str:
         "",
         format_top_oi_strikes(oi),
         "",
-        "Suggested leg quotes:",
+        "Suggested leg quotes (reference A):",
         format_suggested_legs_with_chain(chain, greeks),
-        "",
-        "ATM strip (sample):",
-        format_atm_strip(chain, greeks.atm_strike, width=4),
     ]
+    from services.strike_candidates import format_strike_candidates_table
+
+    cand_block = format_strike_candidates_table(getattr(greeks, "strike_candidates", None) or [])
+    lines.extend(["", cand_block, "", "ATM strip (sample):", format_atm_strip(chain, greeks.atm_strike, width=4)])
     if dual:
         lines.extend(["", dual])
     lines.extend(["", reliability_legend()])

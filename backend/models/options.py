@@ -1,5 +1,7 @@
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+from models.compat import Literal
 
 
 class StrikeGreeks(BaseModel):
@@ -35,6 +37,40 @@ class OIAnalysis(BaseModel):
     top_call_strikes: List[Dict[str, Any]]
 
 
+class StrikeCandidate(BaseModel):
+    candidate_id: str
+    strategy: Literal[
+        "IRON_CONDOR",
+        "IRON_BUTTERFLY",
+        "BULL_PUT_SPREAD",
+        "BEAR_CALL_SPREAD",
+        "SHORT_STRANGLE",
+    ]
+    label: str
+    sell_put_strike: Optional[int] = None
+    buy_put_strike: Optional[int] = None
+    sell_call_strike: Optional[int] = None
+    buy_call_strike: Optional[int] = None
+    net_premium_ltp: float = 0.0
+    max_profit_ltp: float = 0.0
+    max_loss_ltp: float = 0.0
+    lower_breakeven: Optional[float] = None
+    upper_breakeven: Optional[float] = None
+    short_put_delta: Optional[float] = None
+    short_call_delta: Optional[float] = None
+    put_distance_pts: Optional[float] = None
+    call_distance_pts: Optional[float] = None
+    vs_implied_move: str = ""
+    notes: str = ""
+    est_pop_pct: Optional[float] = None
+    pop_method: Optional[str] = None
+    reward_risk: Optional[float] = None
+    composite_score: Optional[float] = None
+    put_wing_pts: Optional[int] = None
+    call_wing_pts: Optional[int] = None
+    is_recommended: bool = False
+
+
 class GreeksData(BaseModel):
     atm_strike: int
     atm_iv: float
@@ -52,3 +88,4 @@ class GreeksData(BaseModel):
     atm_call: StrikeGreeks
     atm_put: StrikeGreeks
     greeks_source: str = "calculated_ltp"
+    strike_candidates: List[StrikeCandidate] = []

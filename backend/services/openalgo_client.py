@@ -1,15 +1,28 @@
 import math
 import random
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date, datetime, timedelta
 import pandas as pd
 import numpy as np
 from config import (
+    LOT_SIZE,
     OPENALGO_API_KEY,
     OPENALGO_HOST,
+    OPENALGO_CALL_TIMEOUT_SECS,
     STRIKE_INTERVAL,
     CHAIN_STRIKE_COUNT,
     OPENALGO_MAX_STRIKE_COUNT,
 )
+
+
+def _call_with_timeout(func, timeout_secs: float):
+    """Run a blocking OpenAlgo SDK call without hanging the API worker indefinitely."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(func)
+        try:
+            return future.result(timeout=timeout_secs)
+        except FuturesTimeoutError as exc:
+            raise TimeoutError(f"OpenAlgo call timed out after {timeout_secs}s") from exc
 
 
 RISK_FREE_RATE = 0.06
@@ -149,6 +162,7 @@ def _generate_mock_chain(spot: float) -> pd.DataFrame:
 
         rows.append({
             "strike": int(strike),
+            "lot_size": LOT_SIZE,
             "put_oi": max(put_oi, 0),
             "call_oi": max(call_oi, 0),
             "put_ltp": max(round(put_ltp, 2), 0.5),
@@ -438,28 +452,34 @@ class OpenAlgoService:
             print(f"[OpenAlgo] expiry lookup failed: {e}")
         return None
 
+    def _fetch_live_market_quotes(self) -> dict:
+        quote = self._response_data(self._client.quotes(symbol="NIFTY", exchange="NSE_INDEX"))
+        if not quote:
+            raise ValueError("OpenAlgo NIFTY quote returned no data")
+
+        vix_quote = self._response_data(self._client.quotes(symbol="INDIAVIX", exchange="NSE_INDEX"))
+        ltp = self._to_float(quote.get("ltp"), self._mock_spot)
+        prev_close = self._to_float(quote.get("prev_close"), ltp)
+        vix = self._to_float(vix_quote.get("ltp"), self._mock_vix)
+        return {
+            "nifty_spot": ltp,
+            "vix": vix,
+            "change_pct": round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
+            "today_open": self._to_float(quote.get("open"), ltp),
+            "today_high": self._to_float(quote.get("high"), ltp),
+            "today_low": self._to_float(quote.get("low"), ltp),
+            "prev_close": prev_close,
+            "is_mock": False,
+            "data_source": "openalgo",
+        }
+
     def get_market_data(self) -> dict:
         try:
             if self._connected and OPENALGO_API_KEY:
-                quote = self._response_data(self._client.quotes(symbol="NIFTY", exchange="NSE_INDEX"))
-                if not quote:
-                    raise ValueError("OpenAlgo NIFTY quote returned no data")
-
-                vix_quote = self._response_data(self._client.quotes(symbol="INDIAVIX", exchange="NSE_INDEX"))
-                ltp = self._to_float(quote.get("ltp"), self._mock_spot)
-                prev_close = self._to_float(quote.get("prev_close"), ltp)
-                vix = self._to_float(vix_quote.get("ltp"), self._mock_vix)
-                return {
-                    "nifty_spot": ltp,
-                    "vix": vix,
-                    "change_pct": round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
-                    "today_open": self._to_float(quote.get("open"), ltp),
-                    "today_high": self._to_float(quote.get("high"), ltp),
-                    "today_low": self._to_float(quote.get("low"), ltp),
-                    "prev_close": prev_close,
-                    "is_mock": False,
-                    "data_source": "openalgo",
-                }
+                return _call_with_timeout(
+                    self._fetch_live_market_quotes,
+                    OPENALGO_CALL_TIMEOUT_SECS,
+                )
         except Exception as e:
             print(f"[OpenAlgo] get_market_data failed: {e}")
 

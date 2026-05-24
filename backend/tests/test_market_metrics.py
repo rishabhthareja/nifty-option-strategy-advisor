@@ -50,6 +50,7 @@ def test_intraday_context():
     )
     text = intraday_context(m)
     assert "today open" in text.lower()
+    assert "% of range" in text
 
 
 def test_0dte_cutoff():

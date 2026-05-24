@@ -153,6 +153,20 @@ export default function StrategyCard({ data }) {
 
       <div className={`border rounded-lg px-4 py-3 text-center ${stColor}`}>
         <span className="text-2xl font-bold tracking-widest">{data.strategy.replace(/_/g, ' ')}</span>
+        {data.strike_candidate_id && (
+          <div className="text-xs text-gray-400 mt-1 font-mono">
+            Strike set <span className="text-cyan-400 font-bold">{data.strike_candidate_id}</span>
+            {data.est_pop_pct != null && (
+              <span className="text-gray-500"> · est POP {data.est_pop_pct}%</span>
+            )}
+            {data.reward_risk != null && (
+              <span className="text-gray-500"> · R:R {data.reward_risk}</span>
+            )}
+            {data.spot_snapshot != null && (
+              <span className="text-gray-500"> · spot {data.spot_snapshot}</span>
+            )}
+          </div>
+        )}
       </div>
 
       {data.structure_note && (

@@ -1,5 +1,7 @@
 from pydantic import BaseModel
-from typing import List, Optional, Literal
+from typing import List, Optional
+
+from models.compat import Literal
 
 
 class StrategyRecommendation(BaseModel):
@@ -32,6 +34,7 @@ class StrategyRecommendation(BaseModel):
     chain_live: Optional[bool] = None
     data_trade_ready: Optional[bool] = None
     integrity_blocked: Optional[bool] = None
+    preflight_blocked: Optional[bool] = None
     integrity_note: Optional[str] = None
     option_expiry: Optional[str] = None
     days_to_expiry: Optional[int] = None
@@ -42,6 +45,18 @@ class StrategyRecommendation(BaseModel):
     conservative_max_loss: Optional[float] = None
     conservative_lower_breakeven: Optional[float] = None
     conservative_upper_breakeven: Optional[float] = None
+    strike_candidate_id: Optional[str] = None
+    est_pop_pct: Optional[float] = None
+    reward_risk: Optional[float] = None
+    composite_score: Optional[float] = None
+    spot_snapshot: Optional[float] = None
+    pcr_snapshot: Optional[float] = None
+    iv_rank_snapshot: Optional[float] = None
+    net_delta: Optional[float] = None
+    theta_per_day: Optional[float] = None
+    available_margin: Optional[float] = None
+    estimated_margin: Optional[float] = None
+    margin_note: Optional[str] = None
     aligned_signals: List[str] = []
     conflicting_signals: List[str] = []
     reasoning: str

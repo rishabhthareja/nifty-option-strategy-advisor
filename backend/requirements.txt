@@ -6,8 +6,10 @@ langsmith
 openalgo
 pandas
 numpy
+scipy
 python-dotenv
 pydantic
+typing_extensions>=4.0.0
 sse-starlette
 httpx
 certifi

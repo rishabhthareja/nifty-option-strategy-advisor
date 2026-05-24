@@ -33,7 +33,9 @@ export default function GreeksTable({ data, strategy }) {
         </div>
         <div className="bg-gray-900 rounded p-2 text-center">
           <div className="text-xs text-gray-500">Daily Move</div>
-          <div className="text-lg font-bold text-purple-400">±{data.expected_daily_move.toFixed(0)}</div>
+          <div className="text-lg font-bold text-purple-400">
+            ±{data.expected_daily_move != null ? data.expected_daily_move.toFixed(0) : '—'}
+          </div>
           <div className="text-xs text-gray-400">points</div>
         </div>
       </div>

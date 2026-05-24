@@ -14,7 +14,7 @@ function isMarketOpen() {
 export default function LiveTicker() {
   const [data, setData] = useState(null)
   const [lastUpdated, setLastUpdated] = useState(null)
-  const [error, setError] = useState(false)
+  const [error, setError] = useState(null)
   const open = isMarketOpen()
 
   const fetchData = async () => {
@@ -22,9 +22,9 @@ export default function LiveTicker() {
       const d = await getLiveData()
       setData(d)
       setLastUpdated(new Date().toLocaleTimeString())
-      setError(false)
-    } catch {
-      setError(true)
+      setError(null)
+    } catch (e) {
+      setError(e?.message || 'Connection error')
     }
   }
 
@@ -71,7 +71,10 @@ export default function LiveTicker() {
       )}
 
       <div className="ml-auto flex items-center gap-3">
-        {data?.is_mock && (
+        {data?.warming && (
+          <span className="text-xs bg-blue-900/40 text-blue-400 border border-blue-800 px-2 py-0.5 rounded">LOADING</span>
+        )}
+        {data?.is_mock && !data?.warming && (
           <span className="text-xs bg-yellow-900/40 text-yellow-400 border border-yellow-700 px-2 py-0.5 rounded">MOCK DATA</span>
         )}
         {data && !data.is_mock && (
@@ -86,7 +89,12 @@ export default function LiveTicker() {
           }
         </div>
         {lastUpdated && <span className="text-gray-600 text-xs">Updated {lastUpdated}</span>}
-        {error && <span className="text-red-400 text-xs">Connection error</span>}
+        {data?.stale && (
+          <span className="text-xs bg-orange-900/40 text-orange-400 border border-orange-800 px-2 py-0.5 rounded">
+            STALE
+          </span>
+        )}
+        {error && <span className="text-red-400 text-xs max-w-xs truncate" title={error}>{error}</span>}
       </div>
     </div>
   )

@@ -1,7 +1,8 @@
 import math
 import pandas as pd
-from models.market import MarketData
+from models.market import MarketData, TechnicalData
 from models.options import OIAnalysis, GreeksData, StrikeGreeks
+from services.strike_candidates import build_strike_candidates
 from config import STRIKE_INTERVAL
 from services.market_metrics import straddle_expected_move
 
@@ -29,7 +30,12 @@ def _get_strike_greeks(chain: pd.DataFrame, strike: int, option_type: str) -> St
     )
 
 
-def greeks_agent(chain: pd.DataFrame, market_data: MarketData, oi_analysis: OIAnalysis) -> GreeksData:
+def greeks_agent(
+    chain: pd.DataFrame,
+    market_data: MarketData,
+    oi_analysis: OIAnalysis,
+    technical: TechnicalData | None = None,
+) -> GreeksData:
     spot = market_data.nifty_spot
     atm_strike = int(round(spot / STRIKE_INTERVAL) * STRIKE_INTERVAL)
 
@@ -68,7 +74,7 @@ def greeks_agent(chain: pd.DataFrame, market_data: MarketData, oi_analysis: OIAn
         buy_call.greeks_source,
     }
 
-    return GreeksData(
+    greeks = GreeksData(
         atm_strike=atm_strike,
         atm_iv=atm_iv,
         expected_daily_move=expected_daily_move,
@@ -86,3 +92,8 @@ def greeks_agent(chain: pd.DataFrame, market_data: MarketData, oi_analysis: OIAn
         atm_put=atm_put,
         greeks_source=source_counts.pop() if len(source_counts) == 1 else "mixed",
     )
+    if technical is not None:
+        greeks.strike_candidates = build_strike_candidates(
+            chain, market_data, technical, oi_analysis, greeks
+        )
+    return greeks

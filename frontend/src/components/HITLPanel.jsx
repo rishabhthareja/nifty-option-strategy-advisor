@@ -17,6 +17,14 @@ export default function HITLPanel({ runId, strategy, evaluation, onDecision }) {
       <p className="text-red-300/80 text-sm mt-1">{strategy.integrity_note || 'Quotes and option chain must be live before approval.'}</p>
     </div>
   )
+  if (evaluation?.status === 'skipped') {
+    return (
+      <div className="bg-gray-900/40 border border-gray-700 rounded-lg p-4 text-center">
+        <p className="text-gray-400 font-bold">Evaluator skipped (pre-flight WAIT).</p>
+        <p className="text-gray-500 text-sm mt-1">No orders — entry guardrails blocked the trade.</p>
+      </div>
+    )
+  }
   if (!evaluation?.is_validated) return (
     <div className="bg-yellow-900/20 border border-yellow-800 rounded-lg p-4 text-center">
       <p className="text-yellow-400 font-bold">Strategy not validated by evaluator (score too low).</p>

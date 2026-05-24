@@ -1,3 +1,7 @@
+function isEvaluatorSkipped(data) {
+  return data?.status === 'skipped' || data?.skipped === true
+}
+
 export default function EvaluatorPanel({ data, strategy }) {
   if (!data) return (
     <div className="bg-[#1a1a1a] border border-gray-800 rounded-lg p-4">
@@ -6,7 +10,36 @@ export default function EvaluatorPanel({ data, strategy }) {
     </div>
   )
 
+  if (isEvaluatorSkipped(data)) {
+    const reason = data.reason === 'pre_flight' ? 'pre-flight guardrails' : (data.reason || 'system')
+    return (
+      <div className="bg-[#1a1a1a] border border-gray-800 rounded-lg p-4 space-y-3">
+        <h2 className="text-sm font-bold text-blue-400 tracking-widest uppercase">Independent Evaluator</h2>
+        <div className="bg-gray-900/80 border border-gray-700 rounded-lg p-4 text-center space-y-2">
+          <p className="text-gray-400 text-sm font-semibold uppercase tracking-wide">Skipped</p>
+          <p className="text-gray-300 text-sm">
+            No evaluator LLM run — strategy already returned WAIT from {reason}.
+          </p>
+          {strategy?.wait_reason && (
+            <p className="text-xs text-yellow-300/90 text-left leading-snug border-t border-gray-700 pt-2 mt-2">
+              {strategy.wait_reason}
+            </p>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   const score = data.quality_score
+  if (score == null || typeof score !== 'number') {
+    return (
+      <div className="bg-[#1a1a1a] border border-gray-800 rounded-lg p-4">
+        <h2 className="text-sm font-bold text-blue-400 tracking-widest uppercase mb-3">Evaluator</h2>
+        <p className="text-gray-500 text-sm">Evaluation result unavailable.</p>
+      </div>
+    )
+  }
+
   const scoreColor = score >= 8 ? 'text-green-400' : score >= 6 ? 'text-yellow-400' : 'text-red-400'
   const scoreRing = score >= 8 ? 'border-green-500' : score >= 6 ? 'border-yellow-500' : 'border-red-500'
   const confColor = {

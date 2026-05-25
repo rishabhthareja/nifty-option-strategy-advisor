@@ -59,6 +59,8 @@ def greeks_agent(
     sell_put_strike = oi_analysis.support + STRIKE_INTERVAL
     buy_put_strike = oi_analysis.support - STRIKE_INTERVAL
     sell_call_strike = oi_analysis.resistance - STRIKE_INTERVAL
+    if sell_call_strike <= spot:
+        sell_call_strike = atm_strike + STRIKE_INTERVAL
     buy_call_strike = oi_analysis.resistance + STRIKE_INTERVAL
 
     atm_call = _get_strike_greeks(chain, atm_strike, "call")
@@ -93,7 +95,9 @@ def greeks_agent(
         greeks_source=source_counts.pop() if len(source_counts) == 1 else "mixed",
     )
     if technical is not None:
-        greeks.strike_candidates = build_strike_candidates(
+        candidates, build_stats = build_strike_candidates(
             chain, market_data, technical, oi_analysis, greeks
         )
+        greeks.strike_candidates = candidates
+        greeks.candidate_build_stats = build_stats
     return greeks

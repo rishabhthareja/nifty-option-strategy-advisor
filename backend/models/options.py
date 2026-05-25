@@ -89,3 +89,4 @@ class GreeksData(BaseModel):
     atm_put: StrikeGreeks
     greeks_source: str = "calculated_ltp"
     strike_candidates: List[StrikeCandidate] = []
+    candidate_build_stats: Dict[str, Any] = {}

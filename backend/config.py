@@ -10,6 +10,8 @@ configure_ssl()  # before Gemini / LangSmith HTTPS calls
 OPENALGO_API_KEY = os.getenv("OPENALGO_API_KEY", "")
 OPENALGO_HOST = os.getenv("OPENALGO_HOST", "http://127.0.0.1:5000")
 OPENALGO_CALL_TIMEOUT_SECS = float(os.getenv("OPENALGO_CALL_TIMEOUT_SECS", "8"))
+# Option chain + multiquote can take 30–60s on a wide NFO book
+OPENALGO_CHAIN_TIMEOUT_SECS = float(os.getenv("OPENALGO_CHAIN_TIMEOUT_SECS", "90"))
 LIVE_DATA_CACHE_SECS = float(os.getenv("LIVE_DATA_CACHE_SECS", "15"))
 ENABLE_LIVE_ORDERS = os.getenv("ENABLE_LIVE_ORDERS", "false").lower() == "true"
 

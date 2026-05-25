@@ -238,6 +238,11 @@ def _composite_score(est_pop: float, reward_risk: float) -> float:
     return round(POP_SCORE_WEIGHT * est_pop + RR_SCORE_WEIGHT * rr_pts, 1)
 
 
+def _shorts_are_otm(spot: float, sp: int, sc: int) -> bool:
+    """Iron condor shorts must be OTM: put below spot, call above spot."""
+    return sp < spot and sc > spot
+
+
 def _vs_move_note(spot: float, sp: int, sc: int, implied_move: float) -> str:
     if implied_move <= 0:
         return "implied move n/a"
@@ -292,8 +297,10 @@ def _build_iron_condor_candidate(
     notes: str,
     *,
     wing: int = STRIKE_INTERVAL,
-) -> StrikeCandidate:
+) -> Optional[StrikeCandidate]:
     spot = float(market.nifty_spot)
+    if not _shorts_are_otm(spot, sp, sc):
+        return None
     bp = sp - wing
     bc = sc + wing
     net, max_p, max_l, lo, hi, put_w, call_w = _iron_condor_financials(chain, sp, bp, sc, bc)
@@ -375,24 +382,25 @@ def _shorts_meet_move_cushion(
     ) >= implied_move * MIN_SHORT_MOVE_MULT
 
 
+def _meets_pop_rr_floors(c: StrikeCandidate) -> bool:
+    return (c.est_pop_pct or 0) >= MIN_EST_POP_PCT and (c.reward_risk or 0) >= MIN_REWARD_RISK
+
+
 def _mark_recommended(candidates: list[StrikeCandidate]) -> None:
-    """Flag best iron condor by composite score that clears POP/R:R floors."""
-    condors = [
-        c
-        for c in candidates
-        if c.strategy == "IRON_CONDOR"
-        and (c.est_pop_pct or 0) >= MIN_EST_POP_PCT
-        and (c.reward_risk or 0) >= MIN_REWARD_RISK
-    ]
-    if not condors:
-        condors = [c for c in candidates if c.strategy == "IRON_CONDOR"]
+    """Flag best tradeable iron condor; never mark below-floor setups as RECOMMENDED."""
+    condors = [c for c in candidates if c.strategy == "IRON_CONDOR"]
     if not condors:
         return
-    best = max(condors, key=lambda c: (c.composite_score or 0, c.est_pop_pct or 0))
+    tradeable = [c for c in condors if _meets_pop_rr_floors(c)]
+    pool = tradeable if tradeable else condors
+    best = max(pool, key=lambda c: (c.composite_score or 0, c.est_pop_pct or 0))
     for c in candidates:
-        c.is_recommended = c.candidate_id == best.candidate_id
-    if best.is_recommended:
-        best.notes += " | RECOMMENDED (best POP/R:R balance)."
+        c.is_recommended = False
+    if tradeable and best in tradeable:
+        best.is_recommended = True
+        best.notes += " | RECOMMENDED (meets POP/R:R floors)."
+    else:
+        best.notes += " | best_scored (below POP/R:R floors — not tradeable)."
 
 
 def recommended_candidate(
@@ -413,10 +421,11 @@ def build_strike_candidates(
     technical: TechnicalData,
     oi: OIAnalysis,
     greeks: GreeksData,
-) -> list[StrikeCandidate]:
+) -> tuple[list[StrikeCandidate], dict]:
     if chain is None or getattr(chain, "empty", True):
-        return []
+        return [], {"candidates_rejected_itm": 0, "candidates_otm_valid": 0}
 
+    rejected_itm = 0
     spot = float(market.nifty_spot)
     implied_move = float(greeks.expected_daily_move or 0)
     atm_iv = float(greeks.atm_iv or 0)
@@ -425,39 +434,35 @@ def build_strike_candidates(
     wing = STRIKE_INTERVAL
     candidates: list[StrikeCandidate] = []
 
+    def _append_ic(sp: int, sc: int, cid: str, label: str, note: str) -> None:
+        nonlocal rejected_itm
+        c = _build_iron_condor_candidate(
+            chain, market, implied_move, atm_iv, dte, cid, label, sp, sc, note
+        )
+        if c is None:
+            rejected_itm += 1
+            return
+        candidates.append(c)
+
     sp_a = greeks.sell_put_strike
     sc_a = greeks.sell_call_strike
-    candidates.append(
-        _build_iron_condor_candidate(
-            chain,
-            market,
-            implied_move,
-            atm_iv,
-            dte,
-            "A",
-            "Iron condor (OI walls)",
-            sp_a,
-            sc_a,
-            f"Short put support+{wing} ({oi.support}), short call resistance-{wing} ({oi.resistance}).",
-        )
+    _append_ic(
+        sp_a,
+        sc_a,
+        "A",
+        "Iron condor (OI walls)",
+        f"Short put support+{wing} ({oi.support}), short call resistance-{wing} ({oi.resistance}).",
     )
 
     sp_b = int(oi.support)
     sc_b = sc_a
     if (sp_b, sc_b) != (sp_a, sc_a):
-        candidates.append(
-            _build_iron_condor_candidate(
-                chain,
-                market,
-                implied_move,
-                atm_iv,
-                dte,
-                "B",
-                "Iron condor (wider put at support)",
-                sp_b,
-                sc_b,
-                f"Short put at OI support {oi.support}; equal {wing} wings both sides.",
-            )
+        _append_ic(
+            sp_b,
+            sc_b,
+            "B",
+            "Iron condor (wider put at support)",
+            f"Short put at OI support {oi.support}; equal {wing} wings both sides.",
         )
 
     dp, dc = _find_pop_condor_short_pair(chain, spot, implied_move, atm_iv, dte)
@@ -465,19 +470,12 @@ def build_strike_candidates(
         key_d = (dp, dc)
         existing = {(c.sell_put_strike, c.sell_call_strike) for c in candidates}
         if key_d not in existing:
-            candidates.append(
-                _build_iron_condor_candidate(
-                    chain,
-                    market,
-                    implied_move,
-                    atm_iv,
-                    dte,
-                    "D",
-                    "Iron condor (POP-first ~0.17 delta)",
-                    dp,
-                    dc,
-                    f"Shorts near {POP_DELTA_TARGET} delta; both outside {MIN_SHORT_MOVE_MULT}x implied move.",
-                )
+            _append_ic(
+                dp,
+                dc,
+                "D",
+                "Iron condor (POP-first ~0.17 delta)",
+                f"Shorts near {POP_DELTA_TARGET} delta; both outside {MIN_SHORT_MOVE_MULT}x implied move.",
             )
 
     trend = (technical.trend or "").upper()
@@ -544,6 +542,17 @@ def build_strike_candidates(
         unique.append(c)
 
     _mark_recommended(unique)
+    otm_valid = sum(
+        1
+        for c in unique
+        if c.strategy == "IRON_CONDOR"
+        and c.sell_put_strike is not None
+        and c.sell_call_strike is not None
+    )
+    stats = {
+        "candidates_rejected_itm": rejected_itm,
+        "candidates_otm_valid": otm_valid,
+    }
     return sorted(
         unique,
         key=lambda c: (
@@ -551,7 +560,7 @@ def build_strike_candidates(
             -(c.composite_score or 0),
             -(c.est_pop_pct or 0),
         ),
-    )
+    ), stats
 
 
 def format_strike_candidates_table(candidates: list[StrikeCandidate]) -> str:

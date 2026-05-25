@@ -111,13 +111,19 @@ def is_below_min_entry_dte(expiry: str | None, now: datetime | None = None) -> b
 
 
 def _load_chain_expiry(service, expiry: str) -> str | None:
+    """Return expiry only when OpenAlgo returns a live (non-mock) chain probe."""
+    probe = getattr(service, "probe_live_chain", None)
+    if callable(probe):
+        return expiry if probe(expiry) else None
     try:
         chain = service.get_options_chain(expiry=expiry)
-        if chain is not None and not getattr(chain, "empty", True):
-            return str(getattr(chain, "attrs", {}).get("expiry") or expiry)
+        if chain is None or getattr(chain, "empty", True):
+            return None
+        if getattr(chain, "attrs", {}).get("source") == "mock":
+            return None
+        return str(getattr(chain, "attrs", {}).get("expiry") or expiry)
     except Exception:
-        pass
-    return None
+        return None
 
 
 def resolve_chain_expiry(service, now: datetime | None = None) -> str:

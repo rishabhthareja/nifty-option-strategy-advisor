@@ -14,8 +14,9 @@ def options_chain_agent(market_data: MarketData) -> pd.DataFrame:
     service = OpenAlgoService()
     session_calendar = nifty_weekly_expiry_for_session()
     entry_target = resolve_weekly_entry_expiry()
+    spot = float(market_data.nifty_spot)
     expiry = resolve_chain_expiry(service)
-    chain = service.get_options_chain(expiry=expiry)
+    chain = service.get_options_chain(expiry=expiry, spot=spot)
     preserved_attrs = dict(getattr(chain, "attrs", {}) or {})
     resolved = preserved_attrs.get("expiry") or expiry
     if resolved and not preserved_attrs.get("expiry"):

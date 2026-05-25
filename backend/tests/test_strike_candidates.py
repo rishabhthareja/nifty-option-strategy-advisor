@@ -113,8 +113,13 @@ def _technical():
     )
 
 
+def _build(*args, **kwargs):
+    cands, _stats = build_strike_candidates(*args, **kwargs)
+    return cands
+
+
 def test_equal_wings_on_b():
-    cands = build_strike_candidates(_chain(), _market(), _technical(), _oi(), _greeks())
+    cands = _build(_chain(), _market(), _technical(), _oi(), _greeks())
     b = candidate_by_id(cands, "B")
     assert b is not None
     assert b.put_wing_pts == 50
@@ -122,7 +127,7 @@ def test_equal_wings_on_b():
 
 
 def test_pop_rr_metrics_present():
-    cands = build_strike_candidates(_chain(), _market(), _technical(), _oi(), _greeks())
+    cands = _build(_chain(), _market(), _technical(), _oi(), _greeks())
     for c in cands:
         if c.strategy == "IRON_CONDOR":
             assert c.est_pop_pct is not None
@@ -131,15 +136,14 @@ def test_pop_rr_metrics_present():
 
 
 def test_recommended_condor_exists():
-    cands = build_strike_candidates(_chain(), _market(), _technical(), _oi(), _greeks())
+    cands = _build(_chain(), _market(), _technical(), _oi(), _greeks())
     rec = recommended_candidate(cands)
     assert rec is not None
-    assert rec.is_recommended
     assert rec.strategy == "IRON_CONDOR"
 
 
 def test_recommended_has_highest_composite_among_condors():
-    cands = build_strike_candidates(_chain(), _market(), _technical(), _oi(), _greeks())
+    cands = _build(_chain(), _market(), _technical(), _oi(), _greeks())
     rec = recommended_candidate(cands)
     assert rec is not None
     condors = [c for c in cands if c.strategy == "IRON_CONDOR"]
@@ -148,7 +152,7 @@ def test_recommended_has_highest_composite_among_condors():
 
 
 def test_table_shows_pop_rr():
-    cands = build_strike_candidates(_chain(), _market(), _technical(), _oi(), _greeks())
+    cands = _build(_chain(), _market(), _technical(), _oi(), _greeks())
     text = format_strike_candidates_table(cands)
     assert "est_POP%" in text
     assert "R:R" in text
@@ -156,8 +160,51 @@ def test_table_shows_pop_rr():
 
 
 def test_recommended_meets_floors_or_best_effort():
-    cands = build_strike_candidates(_chain(), _market(), _technical(), _oi(), _greeks())
+    cands = _build(_chain(), _market(), _technical(), _oi(), _greeks())
     rec = recommended_candidate(cands)
     assert rec is not None
-    if (rec.est_pop_pct or 0) >= MIN_EST_POP_PCT:
-        assert (rec.reward_risk or 0) >= MIN_REWARD_RISK or rec.composite_score
+    if rec.is_recommended:
+        assert (rec.est_pop_pct or 0) >= MIN_EST_POP_PCT
+        assert (rec.reward_risk or 0) >= MIN_REWARD_RISK
+    else:
+        assert "best_scored" in (rec.notes or "").lower()
+
+
+def test_itm_call_condors_rejected_at_build():
+    """Spot above OI-wall short call must not appear as IC candidates A/B."""
+    market = MarketData(
+        nifty_spot=23969.0,
+        vix=17.0,
+        change_pct=1.0,
+        today_open=23940.0,
+        today_high=23989.0,
+        today_low=23922.0,
+        prev_close=23719.0,
+    )
+    oi = OIAnalysis(
+        support=23000,
+        support_put_oi=1e6,
+        resistance=24000,
+        resistance_call_oi=1e6,
+        pcr=0.87,
+        pcr_sentiment="MILDLY BEARISH",
+        max_pain=24000,
+        max_pain_distance=-31.0,
+        iv_rank=42.0,
+        iv_environment="MODERATE",
+        range_width=1000.0,
+        range_width_pct=4.0,
+        top_put_strikes=[],
+        top_call_strikes=[],
+    )
+    g = _greeks()
+    g.sell_call_strike = 23950
+    g.sell_put_strike = 23050
+    cands, stats = build_strike_candidates(_chain(), market, _technical(), oi, g)
+    ids = {c.candidate_id for c in cands if c.strategy == "IRON_CONDOR"}
+    assert "A" not in ids
+    assert "B" not in ids
+    assert stats["candidates_rejected_itm"] >= 1
+    for c in cands:
+        if c.strategy == "IRON_CONDOR" and c.sell_call_strike is not None:
+            assert c.sell_call_strike > market.nifty_spot

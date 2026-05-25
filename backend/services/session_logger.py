@@ -33,13 +33,15 @@ class SessionLogger:
     def set_timing(self, agent_name: str, elapsed_seconds: float):
         self.agent_timings[agent_name] = round(elapsed_seconds, 2)
 
-    def save_master(self):
+    def save_master(self, journal: dict | None = None):
         master = {
             "run_id": self.run_id,
             "timestamp": datetime.now().isoformat(),
             "agent_timings": self.agent_timings,
             "agents": self.agent_outputs,
         }
+        if journal:
+            master["journal"] = journal
         filepath = self.log_dir / "00_master.json"
         with open(filepath, "w") as f:
             json.dump(master, f, indent=2, default=str)

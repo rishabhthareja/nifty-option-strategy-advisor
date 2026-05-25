@@ -9,6 +9,7 @@ from config import (
     OPENALGO_API_KEY,
     OPENALGO_HOST,
     OPENALGO_CALL_TIMEOUT_SECS,
+    OPENALGO_CHAIN_TIMEOUT_SECS,
     STRIKE_INTERVAL,
     CHAIN_STRIKE_COUNT,
     OPENALGO_MAX_STRIKE_COUNT,
@@ -197,6 +198,7 @@ class OpenAlgoService:
         self._client = None
         self._mock_spot = 22347.50
         self._mock_vix = 14.82
+        self._last_live_spot: float | None = None
         self._connected = False
         self._try_connect()
 
@@ -418,6 +420,26 @@ class OpenAlgoService:
         )
         return wide_chain, wide_ex, expiry
 
+    def probe_live_chain(self, expiry: str) -> bool:
+        """Lightweight check that OpenAlgo returns a non-empty chain (no full DataFrame build)."""
+        if not self._connected or not OPENALGO_API_KEY:
+            return False
+        exp = self._compact_expiry(expiry)
+        if not exp:
+            return False
+        try:
+
+            def _probe():
+                chain, _, _ = self._fetch_option_chain_candidates(exp, 5)
+                return isinstance(chain, list) and len(chain) > 0
+
+            return bool(
+                _call_with_timeout(_probe, min(OPENALGO_CHAIN_TIMEOUT_SECS, 45.0))
+            )
+        except Exception as e:
+            print(f"[OpenAlgo] probe_live_chain {exp} failed: {e}")
+            return False
+
     @staticmethod
     def _compact_expiry(expiry: str | None) -> str | None:
         if not expiry:
@@ -461,6 +483,7 @@ class OpenAlgoService:
         ltp = self._to_float(quote.get("ltp"), self._mock_spot)
         prev_close = self._to_float(quote.get("prev_close"), ltp)
         vix = self._to_float(vix_quote.get("ltp"), self._mock_vix)
+        self._last_live_spot = ltp
         return {
             "nifty_spot": ltp,
             "vix": vix,
@@ -552,81 +575,115 @@ class OpenAlgoService:
         closes = list(14.0 + np.cumsum(np.random.normal(0, 0.15, days)))
         return pd.DataFrame({"close": closes}, index=dates)
 
-    def get_options_chain(self, expiry: str = None) -> pd.DataFrame:
-        try:
-            if self._connected and OPENALGO_API_KEY:
-                selected_expiry = self._compact_expiry(expiry) or self._next_available_expiry()
-                if not selected_expiry:
-                    raise ValueError("No OpenAlgo NIFTY option expiry available")
+    def _build_live_options_chain(
+        self, expiry: str | None, spot_hint: float | None
+    ) -> pd.DataFrame:
+        selected_expiry = self._compact_expiry(expiry) or self._next_available_expiry()
+        if not selected_expiry:
+            raise ValueError("No OpenAlgo NIFTY option expiry available")
 
-                market = self.get_market_data()
-                spot = market["nifty_spot"]
+        if spot_hint and spot_hint > 0:
+            spot = float(spot_hint)
+        else:
+            market = self.get_market_data()
+            spot = float(market["nifty_spot"])
+        if spot <= 0:
+            raise ValueError("Invalid spot for option chain build")
+        self._last_live_spot = spot
+
+        time_years = self._time_to_expiry_years(selected_expiry)
+        chain, chain_exchange, expiry_used = self._fetch_option_chain_candidates(
+            selected_expiry, CHAIN_STRIKE_COUNT
+        )
+        if not chain and expiry:
+            fallback_expiry = self._next_available_expiry()
+            if fallback_expiry and fallback_expiry != selected_expiry:
+                selected_expiry = fallback_expiry
                 time_years = self._time_to_expiry_years(selected_expiry)
-
                 chain, chain_exchange, expiry_used = self._fetch_option_chain_candidates(
                     selected_expiry, CHAIN_STRIKE_COUNT
                 )
-                if not chain and expiry:
-                    fallback_expiry = self._next_available_expiry()
-                    if fallback_expiry and fallback_expiry != selected_expiry:
-                        selected_expiry = fallback_expiry
-                        time_years = self._time_to_expiry_years(selected_expiry)
-                        chain, chain_exchange, expiry_used = self._fetch_option_chain_candidates(
-                            selected_expiry, CHAIN_STRIKE_COUNT
-                        )
 
-                if isinstance(chain, list) and chain:
-                    rows = []
-                    for item in chain:
-                        ce = item.get("ce") or {}
-                        pe = item.get("pe") or {}
-                        strike = int(float(item.get("strike", 0)))
-                        call_ltp = self._to_float(ce.get("ltp"))
-                        put_ltp = self._to_float(pe.get("ltp"))
-                        call_price, call_price_source = self._price_with_source(ce)
-                        put_price, put_price_source = self._price_with_source(pe)
-                        call_greeks = _black_scholes_greeks(call_price, spot, strike, time_years, "call")
-                        put_greeks = _black_scholes_greeks(put_price, spot, strike, time_years, "put")
-                        call_has_broker_greeks = any(ce.get(k) is not None for k in ("delta", "gamma", "theta", "vega", "iv"))
-                        put_has_broker_greeks = any(pe.get(k) is not None for k in ("delta", "gamma", "theta", "vega", "iv"))
-                        rows.append({
-                            "strike": strike,
-                            "lot_size": int(self._to_float(ce.get("lotsize") or pe.get("lotsize"), 65)),
-                            "put_oi": self._extract_oi(pe),
-                            "call_oi": self._extract_oi(ce),
-                            "put_ltp": put_ltp,
-                            "call_ltp": call_ltp,
-                            "put_bid": self._to_float(pe.get("bid")),
-                            "put_ask": self._to_float(pe.get("ask")),
-                            "call_bid": self._to_float(ce.get("bid")),
-                            "call_ask": self._to_float(ce.get("ask")),
-                            "put_price_used": put_price,
-                            "call_price_used": call_price,
-                            "put_price_source": put_price_source,
-                            "call_price_source": call_price_source,
-                            "put_greeks_source": "broker" if put_has_broker_greeks else f"calculated_{put_price_source}",
-                            "call_greeks_source": "broker" if call_has_broker_greeks else f"calculated_{call_price_source}",
-                            "put_iv": self._to_float(pe.get("iv"), put_greeks["iv"]) or put_greeks["iv"],
-                            "call_iv": self._to_float(ce.get("iv"), call_greeks["iv"]) or call_greeks["iv"],
-                            "put_delta": self._to_float(pe.get("delta"), put_greeks["delta"]) or put_greeks["delta"],
-                            "call_delta": self._to_float(ce.get("delta"), call_greeks["delta"]) or call_greeks["delta"],
-                            "put_theta": self._to_float(pe.get("theta"), put_greeks["theta"]) or put_greeks["theta"],
-                            "call_theta": self._to_float(ce.get("theta"), call_greeks["theta"]) or call_greeks["theta"],
-                            "put_vega": self._to_float(pe.get("vega"), put_greeks["vega"]) or put_greeks["vega"],
-                            "call_vega": self._to_float(ce.get("vega"), call_greeks["vega"]) or call_greeks["vega"],
-                            "put_gamma": self._to_float(pe.get("gamma"), put_greeks["gamma"]) or put_greeks["gamma"],
-                            "call_gamma": self._to_float(ce.get("gamma"), call_greeks["gamma"]) or call_greeks["gamma"],
-                        })
-                    df = pd.DataFrame(rows)
-                    df.attrs["expiry"] = expiry_used
-                    df.attrs["source"] = "openalgo"
-                    df.attrs["chain_exchange"] = chain_exchange
-                    return df
+        if not isinstance(chain, list) or not chain:
+            raise ValueError("OpenAlgo option chain empty")
+
+        rows = []
+        for item in chain:
+            ce = item.get("ce") or {}
+            pe = item.get("pe") or {}
+            strike = int(float(item.get("strike", 0)))
+            if strike <= 0:
+                continue
+            call_ltp = self._to_float(ce.get("ltp"))
+            put_ltp = self._to_float(pe.get("ltp"))
+            call_price, call_price_source = self._price_with_source(ce)
+            put_price, put_price_source = self._price_with_source(pe)
+            call_greeks = _black_scholes_greeks(call_price, spot, strike, time_years, "call")
+            put_greeks = _black_scholes_greeks(put_price, spot, strike, time_years, "put")
+            call_has_broker_greeks = any(
+                ce.get(k) is not None for k in ("delta", "gamma", "theta", "vega", "iv")
+            )
+            put_has_broker_greeks = any(
+                pe.get(k) is not None for k in ("delta", "gamma", "theta", "vega", "iv")
+            )
+            rows.append({
+                "strike": strike,
+                "lot_size": int(self._to_float(ce.get("lotsize") or pe.get("lotsize"), LOT_SIZE)),
+                "put_oi": self._extract_oi(pe),
+                "call_oi": self._extract_oi(ce),
+                "put_ltp": put_ltp,
+                "call_ltp": call_ltp,
+                "put_bid": self._to_float(pe.get("bid")),
+                "put_ask": self._to_float(pe.get("ask")),
+                "call_bid": self._to_float(ce.get("bid")),
+                "call_ask": self._to_float(ce.get("ask")),
+                "put_price_used": put_price,
+                "call_price_used": call_price,
+                "put_price_source": put_price_source,
+                "call_price_source": call_price_source,
+                "put_greeks_source": "broker" if put_has_broker_greeks else f"calculated_{put_price_source}",
+                "call_greeks_source": "broker" if call_has_broker_greeks else f"calculated_{call_price_source}",
+                "put_iv": self._to_float(pe.get("iv"), put_greeks["iv"]) or put_greeks["iv"],
+                "call_iv": self._to_float(ce.get("iv"), call_greeks["iv"]) or call_greeks["iv"],
+                "put_delta": self._to_float(pe.get("delta"), put_greeks["delta"]) or put_greeks["delta"],
+                "call_delta": self._to_float(ce.get("delta"), call_greeks["delta"]) or call_greeks["delta"],
+                "put_theta": self._to_float(pe.get("theta"), put_greeks["theta"]) or put_greeks["theta"],
+                "call_theta": self._to_float(ce.get("theta"), call_greeks["theta"]) or call_greeks["theta"],
+                "put_vega": self._to_float(pe.get("vega"), put_greeks["vega"]) or put_greeks["vega"],
+                "call_vega": self._to_float(ce.get("vega"), call_greeks["vega"]) or call_greeks["vega"],
+                "put_gamma": self._to_float(pe.get("gamma"), put_greeks["gamma"]) or put_greeks["gamma"],
+                "call_gamma": self._to_float(ce.get("gamma"), call_greeks["gamma"]) or call_greeks["gamma"],
+            })
+        if not rows:
+            raise ValueError("OpenAlgo option chain had no valid strikes")
+        df = pd.DataFrame(rows)
+        df.attrs["expiry"] = expiry_used
+        df.attrs["source"] = "openalgo"
+        df.attrs["chain_exchange"] = chain_exchange
+        return df
+
+    def get_options_chain(
+        self, expiry: str = None, spot: float | None = None
+    ) -> pd.DataFrame:
+        spot_hint = float(spot) if spot and spot > 0 else None
+        try:
+            if self._connected and OPENALGO_API_KEY:
+                return _call_with_timeout(
+                    lambda: self._build_live_options_chain(expiry, spot_hint),
+                    OPENALGO_CHAIN_TIMEOUT_SECS,
+                )
         except Exception as e:
             print(f"[OpenAlgo] get_options_chain failed: {e}")
 
-        market = self.get_market_data()
-        df = _generate_mock_chain(market["nifty_spot"])
+        fallback_spot = spot_hint or self._last_live_spot
+        if fallback_spot is None or fallback_spot <= 0:
+            market = self.get_market_data()
+            fallback_spot = float(market["nifty_spot"])
+        print(
+            f"[OpenAlgo] using mock option chain (spot={fallback_spot:.2f}); "
+            "live chain unavailable — pre-flight will block new entries."
+        )
+        df = _generate_mock_chain(fallback_spot)
         df.attrs["source"] = "mock"
         return df
 

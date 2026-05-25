@@ -26,7 +26,22 @@ from services.openalgo_client import OpenAlgoService
 from services.live_market_cache import get_cached_live_data, start_background_refresh
 from services.error_messages import format_sse_error
 from services.session_logger import SessionLogger
+from services.journal_metrics import (
+    build_master_journal,
+    enrich_greeks,
+    enrich_oi,
+    enrich_strategy,
+    enrich_technical,
+)
 from config import ENABLE_LIVE_ORDERS
+from models.trade import TradeCloseRequest, TradeMarkRequest, TradeOpenRequest
+from services import trade_store
+from services.expiry_utils import ist_now
+from services.position_monitor import (
+    auto_mark_open_trades,
+    build_mark_for_trade,
+    close_trade_record,
+)
 
 app = FastAPI(title="Nifty Options Advisor", version="1.0.0")
 
@@ -34,6 +49,7 @@ app = FastAPI(title="Nifty Options Advisor", version="1.0.0")
 @app.on_event("startup")
 def _startup_live_cache():
     start_background_refresh()
+    trade_store.init_db()
 
 
 app.add_middleware(
@@ -173,9 +189,10 @@ async def analyse_stream():
             technical = await asyncio.get_event_loop().run_in_executor(None, technical_agent, market)
             elapsed = time.time() - t0
             logger.set_timing("technical", elapsed)
-            logger.log("technical", _safe_dict(technical), step=2)
-            results["technical"] = _safe_dict(technical)
-            yield await _sse_event({"agent": "technical", "status": "done", "data": _safe_dict(technical), "elapsed": round(elapsed, 2)})
+            technical_payload = enrich_technical(_safe_dict(technical))
+            logger.log("technical", technical_payload, step=2)
+            results["technical"] = technical_payload
+            yield await _sse_event({"agent": "technical", "status": "done", "data": technical_payload, "elapsed": round(elapsed, 2)})
 
             # ── Options Chain ────────────────────────────────────────────────
             yield await _sse_event({"agent": "options_chain", "status": "running"})
@@ -210,9 +227,10 @@ async def analyse_stream():
             oi = await asyncio.get_event_loop().run_in_executor(None, oi_analysis_agent, chain, market)
             elapsed = time.time() - t0
             logger.set_timing("oi_analysis", elapsed)
-            logger.log("oi_analysis", _safe_dict(oi), step=4)
-            results["oi_analysis"] = _safe_dict(oi)
-            yield await _sse_event({"agent": "oi_analysis", "status": "done", "data": _safe_dict(oi), "elapsed": round(elapsed, 2)})
+            oi_payload = enrich_oi(_safe_dict(oi), market.nifty_spot)
+            logger.log("oi_analysis", oi_payload, step=4)
+            results["oi_analysis"] = oi_payload
+            yield await _sse_event({"agent": "oi_analysis", "status": "done", "data": oi_payload, "elapsed": round(elapsed, 2)})
 
             # ── Greeks ───────────────────────────────────────────────────────
             yield await _sse_event({"agent": "greeks", "status": "running"})
@@ -222,9 +240,13 @@ async def analyse_stream():
             )
             elapsed = time.time() - t0
             logger.set_timing("greeks", elapsed)
-            logger.log("greeks", _safe_dict(greeks), step=5)
-            results["greeks"] = _safe_dict(greeks)
-            yield await _sse_event({"agent": "greeks", "status": "done", "data": _safe_dict(greeks), "elapsed": round(elapsed, 2)})
+            greeks_raw = _safe_dict(greeks)
+            build_stats = getattr(greeks, "candidate_build_stats", None) or {}
+            rejected_itm = int(build_stats.get("candidates_rejected_itm", 0))
+            greeks_payload = enrich_greeks(greeks_raw, market.nifty_spot, rejected_itm)
+            logger.log("greeks", greeks_payload, step=5)
+            results["greeks"] = greeks_payload
+            yield await _sse_event({"agent": "greeks", "status": "done", "data": greeks_payload, "elapsed": round(elapsed, 2)})
 
             # ── Strategy ─────────────────────────────────────────────────────
             yield await _sse_event({"agent": "strategy", "status": "running"})
@@ -235,10 +257,17 @@ async def analyse_stream():
             )
             elapsed = time.time() - t0
             logger.set_timing("strategy", elapsed)
-            logger.log("strategy", _safe_dict(strategy), step=6)
-            results["strategy"] = _safe_dict(strategy)
+            strategy_payload = enrich_strategy(
+                _safe_dict(strategy),
+                results["oi_analysis"],
+                results["technical"],
+                results["greeks"],
+                market.nifty_spot,
+            )
+            logger.log("strategy", strategy_payload, step=6)
+            results["strategy"] = strategy_payload
             _pending_strategy[run_id] = strategy
-            yield await _sse_event({"agent": "strategy", "status": "done", "data": _safe_dict(strategy), "elapsed": round(elapsed, 2)})
+            yield await _sse_event({"agent": "strategy", "status": "done", "data": strategy_payload, "elapsed": round(elapsed, 2)})
 
             # ── Evaluator ─────────────────────────────────────────────────────
             evaluation = None
@@ -266,7 +295,8 @@ async def analyse_stream():
                 })
 
             # ── Final ────────────────────────────────────────────────────────
-            logger.save_master()
+            journal = build_master_journal(logger.agent_outputs, market.nifty_spot)
+            logger.save_master(journal=journal)
 
             # Build order details for HITL
             from datetime import datetime, timedelta
@@ -428,3 +458,155 @@ def history():
                         except Exception:
                             pass
     return {"runs": runs}
+
+
+# ── Trade tracking (paper / live lifecycle) ────────────────────────────────────
+
+
+@app.post("/trade/open")
+def trade_open(body: TradeOpenRequest):
+    try:
+        trade_id, warning = trade_store.open_trade_from_request(body)
+        return {
+            "trade_id": trade_id,
+            "message": "Trade opened.",
+            "warning": warning,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.get("/trade/list")
+def trade_list(trade_type: str | None = None, status: str | None = None):
+    trades = trade_store.list_trades(trade_type=trade_type, status=status)
+    stats = trade_store.get_trade_stats(trade_type=trade_type)
+    return {
+        "trades": [_safe_dict(t) for t in trades],
+        "stats": stats.model_dump(),
+    }
+
+
+@app.get("/trade/stats")
+def trade_stats(trade_type: str | None = None):
+    return trade_store.get_trade_stats(trade_type=trade_type).model_dump()
+
+
+@app.get("/trade/{trade_id}")
+def trade_get(trade_id: str):
+    trade = trade_store.get_trade(trade_id)
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    marks = trade_store.get_marks_for_trade(trade_id)
+    latest = trade_store.get_latest_mark(trade_id)
+    latest_alert = latest.exit_alert if latest else "NONE"
+    return {
+        "trade": trade.model_dump(),
+        "marks": [m.model_dump() for m in marks],
+        "latest_alert": latest_alert,
+    }
+
+
+@app.post("/trade/{trade_id}/mark")
+def trade_mark(trade_id: str, body: TradeMarkRequest):
+    trade = trade_store.get_trade(trade_id)
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    if trade.status != "OPEN":
+        raise HTTPException(status_code=400, detail=f"Trade status is {trade.status}")
+
+    today = ist_now().date().isoformat()
+    if trade_store.get_mark_for_date(trade_id, today):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Mark already exists for {today}. Use a different date or close trade.",
+        )
+
+    spot = body.spot
+    if spot is None:
+        try:
+            live = get_cached_live_data()
+            spot = live.get("nifty_spot")
+        except Exception:
+            pass
+
+    built = build_mark_for_trade(
+        trade,
+        today,
+        current_premium=body.current_premium,
+        spot=spot,
+        iv_rank=body.iv_rank,
+        data_source=body.data_source,
+        user_note=body.user_note,
+        fetch_if_missing=body.current_premium is None,
+    )
+
+    if built.get("needs_user_input"):
+        return {
+            "mark_id": None,
+            "unrealized_pnl": None,
+            "pnl_pct_of_max_profit": None,
+            "exit_alert": "NONE",
+            "alert_detail": None,
+            "needs_user_input": True,
+            "user_prompt": built.get("user_prompt"),
+            "fetch_error": built.get("fetch_error"),
+        }
+
+    mark = built["mark"]
+    mark_id = trade_store.add_daily_mark(mark)
+    recommended = "CLOSE" if mark.exit_alert != "NONE" else "HOLD"
+    return {
+        "mark_id": mark_id,
+        "unrealized_pnl": mark.unrealized_pnl,
+        "pnl_pct_of_max_profit": mark.pnl_pct_of_max_profit,
+        "exit_alert": mark.exit_alert,
+        "alert_detail": mark.alert_detail,
+        "needs_user_input": False,
+        "user_prompt": None,
+        "recommended_action": recommended,
+    }
+
+
+@app.post("/trade/mark-all")
+def trade_mark_all():
+    """Manual trigger: broker auto-mark all open trades for today (no full analysis required)."""
+    spot = None
+    iv_rank = None
+    try:
+        live = get_cached_live_data()
+        spot = live.get("nifty_spot")
+        iv_rank = live.get("iv_rank")
+    except Exception:
+        market = OpenAlgoService().get_market_data()
+        spot = market.get("nifty_spot")
+    if spot is None:
+        raise HTTPException(status_code=503, detail="Spot price unavailable for marking")
+
+    result = auto_mark_open_trades(float(spot), iv_rank=iv_rank)
+    return {
+        "agent": "trade_monitor",
+        "open_trades_marked": result["marked"],
+        "trades_needing_mark": result["trades_needing_mark"],
+        "alerts": result["alerts"],
+    }
+
+
+@app.post("/trade/{trade_id}/close")
+def trade_close(trade_id: str, body: TradeCloseRequest):
+    trade = trade_store.get_trade(trade_id)
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    if trade.status != "OPEN":
+        raise HTTPException(status_code=400, detail=f"Trade already {trade.status}")
+
+    try:
+        return close_trade_record(
+            trade,
+            body.exit_premium,
+            body.exit_spot,
+            body.exit_reason,
+            body.exit_triggered_by,
+            notes=body.notes,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e

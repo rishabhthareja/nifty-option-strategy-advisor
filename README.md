@@ -72,6 +72,13 @@ Frontend runs at http://localhost:5173
 | POST | `/approve` | Submit human approval/rejection |
 | POST | `/execute` | Place orders (requires prior approval) |
 | GET | `/history` | List past analysis runs from logs/ |
+| POST | `/trade/open` | Open paper or live trade (entry snapshot) |
+| GET | `/trade/list` | List trades + stats |
+| GET | `/trade/{trade_id}` | Trade detail + daily marks |
+| POST | `/trade/{trade_id}/mark` | Daily mark-to-market (hybrid broker/manual) |
+| POST | `/trade/mark-all` | Auto-mark all open trades for today |
+| POST | `/trade/{trade_id}/close` | Close trade and record realized P&L |
+| GET | `/trade/stats` | Win rate, expectancy, totals |
 
 ## Strategies
 
@@ -96,13 +103,13 @@ When OpenAlgo is not available, realistic mock data is used:
 Each analysis run saves JSON files to:
 ```
 logs/YYYY-MM-DD/<run_id>/
-  00_master.json       ← complete run summary
+  00_master.json       ← complete run summary + journal (trade_outcome, next_check_condition)
   01_market_data.json
-  02_technical.json
+  02_technical.json    ← includes bb_width_signal
   03_options_chain.json
-  04_oi_analysis.json
-  05_greeks.json
-  06_strategy.json
+  04_oi_analysis.json  ← spot_to_resistance_pts, range_position, etc.
+  05_greeks.json       ← expected_move_pct, candidates_rejected_itm
+  06_strategy.json     ← guard_fired, guard_detail, would_trade_at_spot
   07_evaluator.json
 ```
 
@@ -110,7 +117,7 @@ logs/YYYY-MM-DD/<run_id>/
 
 | Setting | Default | Description |
 |---|---|---|
-| `LOT_SIZE` | 75 | Nifty lot size |
+| `LOT_SIZE` | 65 | Nifty lot size (NSE revision from Jan 2026; verify on broker) |
 | `NUM_LOTS` | 1 | Number of lots to trade |
 | `STRIKE_INTERVAL` | 50 | Strike price interval |
 | `MIN_EVALUATOR_SCORE` | 6.0 | Minimum score to validate a strategy |

@@ -29,15 +29,20 @@ class _MockChainService:
     def __init__(self, available: dict[str, str]):
         self.available = available
         self.calls: list[str] = []
+        self.probe_calls: list[str] = []
 
-    def get_options_chain(self, expiry=None):
+    def probe_live_chain(self, expiry=None):
+        self.probe_calls.append(expiry)
+        return expiry in self.available
+
+    def get_options_chain(self, expiry=None, spot=None):
         self.calls.append(expiry)
         key = expiry
         if key not in self.available:
             return pd.DataFrame()
         exp = self.available[key]
         df = pd.DataFrame([{"strike": 23500, "put_oi": 1, "call_oi": 1}])
-        df.attrs = {"expiry": exp, "source": "mock"}
+        df.attrs = {"expiry": exp, "source": "openalgo"}
         return df
 
     def _next_available_expiry(self):
@@ -95,7 +100,7 @@ def test_resolve_chain_expiry_prefers_min_dte_candidate():
     )
     resolved = resolve_chain_expiry(svc, now)
     assert resolved == "12MAY26"
-    assert "12MAY26" in svc.calls
+    assert "12MAY26" in svc.probe_calls
 
 
 def test_resolve_chain_expiry_falls_back_when_only_low_dte():

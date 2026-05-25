@@ -1,14 +1,28 @@
 import { useState } from 'react'
-import { approveOrder, executeOrder } from '../api'
+import { approveOrder, executeOrder, openTrade } from '../api'
 import { expirySummary } from '../utils/formatExpiry'
+import { buildPaperTradeOpenPayload } from '../utils/tradeOpenPayload'
 
-export default function HITLPanel({ runId, strategy, evaluation, onDecision }) {
+export default function HITLPanel({
+  runId,
+  strategy,
+  evaluation,
+  onDecision,
+  onPaperTradeOpened,
+  market,
+  oi,
+  greeks,
+  technical,
+}) {
   const [decision, setDecision] = useState(null) // null | 'approved' | 'rejected'
   const [rejectReason, setRejectReason] = useState('')
   const [showRejectInput, setShowRejectInput] = useState(false)
   const [executing, setExecuting] = useState(false)
   const [execResult, setExecResult] = useState(null)
   const [error, setError] = useState(null)
+  const [trackingPaper, setTrackingPaper] = useState(false)
+  const [paperTradeResult, setPaperTradeResult] = useState(null)
+  const [paperTradeError, setPaperTradeError] = useState(null)
 
   if (!runId || !strategy || strategy.strategy === 'WAIT') return null
   if (strategy.integrity_blocked || strategy.data_trade_ready === false) return (
@@ -57,6 +71,35 @@ export default function HITLPanel({ runId, strategy, evaluation, onDecision }) {
       setError(e.message)
     }
   }
+
+  const handleTrackPaper = async () => {
+    setTrackingPaper(true)
+    setPaperTradeError(null)
+    setPaperTradeResult(null)
+    try {
+      const payload = buildPaperTradeOpenPayload({
+        strategy,
+        runId,
+        oi,
+        greeks,
+        market,
+        technical,
+      })
+      const res = await openTrade(payload)
+      setPaperTradeResult(res)
+      await onPaperTradeOpened?.()
+    } catch (e) {
+      setPaperTradeError(e.message)
+    } finally {
+      setTrackingPaper(false)
+    }
+  }
+
+  const showTrackPaper =
+    decision == null &&
+    strategy?.strategy !== 'WAIT' &&
+    !strategy?.integrity_blocked &&
+    strategy?.data_trade_ready !== false
 
   if (decision === 'approved' && execResult) return (
     <div className="bg-green-900/20 border border-green-700 rounded-lg p-4 text-center">
@@ -167,6 +210,33 @@ export default function HITLPanel({ runId, strategy, evaluation, onDecision }) {
           ✗ {showRejectInput ? 'CONFIRM REJECT' : 'REJECT'}
         </button>
       </div>
+
+      {showTrackPaper && (
+        <div className="border-t border-gray-700 pt-3">
+          <p className="text-xs text-gray-500 mb-2">
+            Not executing live? Track this setup as a paper trade.
+          </p>
+          <button
+            type="button"
+            onClick={handleTrackPaper}
+            disabled={trackingPaper}
+            className="w-full bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 text-gray-300 font-bold py-2 px-4 rounded-lg text-sm transition-colors"
+          >
+            {trackingPaper ? 'Opening paper trade...' : '📋 Track as Paper Trade'}
+          </button>
+          {paperTradeResult && (
+            <p className="text-green-400 text-xs mt-1">
+              Paper trade opened — ID: {paperTradeResult.trade_id}
+              {paperTradeResult.warning && (
+                <span className="text-amber-400 block">{paperTradeResult.warning}</span>
+              )}
+            </p>
+          )}
+          {paperTradeError && (
+            <p className="text-red-400 text-xs mt-1">{paperTradeError}</p>
+          )}
+        </div>
+      )}
     </div>
   )
 }

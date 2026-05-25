@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator
@@ -35,6 +36,7 @@ from services.journal_metrics import (
 )
 from config import ENABLE_LIVE_ORDERS
 from models.trade import TradeCloseRequest, TradeMarkRequest, TradeOpenRequest
+from models.review import PendingReviewCompleteRequest, ReviewNowRequest
 from services import trade_store
 from services.expiry_utils import ist_now
 from services.position_monitor import (
@@ -42,14 +44,24 @@ from services.position_monitor import (
     build_mark_for_trade,
     close_trade_record,
 )
+from services.position_review import (
+    build_review_summary,
+    complete_pending_review,
+    run_position_review,
+)
+from services import review_store
+from services.scheduler import start_scheduler, stop_scheduler
 
-app = FastAPI(title="Nifty Options Advisor", version="1.0.0")
-
-
-@app.on_event("startup")
-def _startup_live_cache():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     start_background_refresh()
     trade_store.init_db()
+    start_scheduler()
+    yield
+    stop_scheduler()
+
+
+app = FastAPI(title="Nifty Options Advisor", version="1.0.0", lifespan=lifespan)
 
 
 app.add_middleware(
@@ -489,6 +501,74 @@ def trade_list(trade_type: str | None = None, status: str | None = None):
 @app.get("/trade/stats")
 def trade_stats(trade_type: str | None = None):
     return trade_store.get_trade_stats(trade_type=trade_type).model_dump()
+
+
+@app.get("/trade/reviews/pending")
+def trade_reviews_pending():
+    pending = review_store.list_pending_reviews()
+    return {"pending": [p.model_dump() for p in pending], "count": len(pending)}
+
+
+@app.post("/trade/review-now")
+def trade_review_now(body: ReviewNowRequest):
+    try:
+        return run_position_review(
+            body.check_slot,
+            trade_id=body.trade_id,
+            bypass_session=True,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/trade/{trade_id}/reviews")
+def trade_reviews_list(trade_id: str):
+    trade = trade_store.get_trade(trade_id)
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    reviews = review_store.list_reviews_for_trade(trade_id)
+    return {"reviews": [r.model_dump() for r in reviews]}
+
+
+@app.get("/trade/{trade_id}/reviews/latest")
+def trade_reviews_latest(trade_id: str):
+    trade = trade_store.get_trade(trade_id)
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    latest = review_store.get_latest_completed_review(trade_id)
+    if not latest:
+        pending = review_store.get_latest_pending_review(trade_id)
+        if pending:
+            return {"review": pending.model_dump(), "status": "PENDING_INPUT"}
+        raise HTTPException(status_code=404, detail="No reviews found")
+    return {"review": latest.model_dump(), "status": "COMPLETED"}
+
+
+@app.get("/trade/{trade_id}/review-summary")
+def trade_review_summary(trade_id: str):
+    try:
+        return build_review_summary(trade_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@app.post("/trade/{trade_id}/reviews/pending/complete")
+def trade_pending_review_complete(trade_id: str, body: PendingReviewCompleteRequest):
+    try:
+        review = complete_pending_review(trade_id, body)
+        return {
+            "review": review.model_dump(),
+            "exit_signal": review.exit_signal,
+            "recommended_action": review.recommended_action,
+            "reasoning": review.reasoning,
+        }
+    except ValueError as e:
+        detail = str(e)
+        try:
+            parsed = json.loads(detail)
+            raise HTTPException(status_code=400, detail=parsed) from e
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail=detail) from e
 
 
 @app.get("/trade/{trade_id}")

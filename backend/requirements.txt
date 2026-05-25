@@ -13,3 +13,4 @@ typing_extensions>=4.0.0
 sse-starlette
 httpx
 certifi
+apscheduler>=3.10.0

@@ -45,6 +45,15 @@ class TradeRecord(BaseModel):
     spot_to_resistance_at_entry: Optional[float] = None
     spot_to_support_at_entry: Optional[float] = None
 
+    pcr_at_entry: Optional[float] = None
+    sell_call_oi_at_entry: Optional[float] = None
+    sell_put_oi_at_entry: Optional[float] = None
+    max_pain_at_entry: Optional[float] = None
+    sell_call_delta_at_entry: Optional[float] = None
+    sell_put_delta_at_entry: Optional[float] = None
+    net_theta_at_entry: Optional[float] = None
+    net_vega_at_entry: Optional[float] = None
+
     exit_date: Optional[str] = None
     exit_spot: Optional[float] = None
     exit_premium: Optional[float] = None
@@ -120,6 +129,14 @@ class TradeOpenRequest(BaseModel):
     range_position_at_entry: Optional[str] = None
     spot_to_resistance_at_entry: Optional[float] = None
     spot_to_support_at_entry: Optional[float] = None
+    pcr_at_entry: Optional[float] = None
+    sell_call_oi_at_entry: Optional[float] = None
+    sell_put_oi_at_entry: Optional[float] = None
+    max_pain_at_entry: Optional[float] = None
+    sell_call_delta_at_entry: Optional[float] = None
+    sell_put_delta_at_entry: Optional[float] = None
+    net_theta_at_entry: Optional[float] = None
+    net_vega_at_entry: Optional[float] = None
     notes: Optional[str] = None
 
 

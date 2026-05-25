@@ -1,4 +1,5 @@
 import { useState, useRef } from 'react'
+import TradeTracker from './components/TradeTracker'
 import LiveTicker from './components/LiveTicker'
 import AgentPipeline from './components/AgentPipeline'
 import TechnicalPanel from './components/TechnicalPanel'
@@ -23,6 +24,7 @@ export default function App() {
   const [startTime, setStartTime] = useState(null)
   const [error, setError] = useState(null)
   const esRef = useRef(null)
+  const tradeTrackerRef = useRef(null)
 
   const handleStart = () => {
     if (isRunning) return
@@ -209,7 +211,12 @@ export default function App() {
               runId={runId}
               strategy={strategy}
               evaluation={evaluation}
+              market={market}
+              oi={oi}
+              greeks={greeks}
+              technical={technical}
               onDecision={(d) => console.log('Decision:', d)}
+              onPaperTradeOpened={() => tradeTrackerRef.current?.refresh()}
             />
           )}
 
@@ -236,6 +243,15 @@ export default function App() {
           </p>
         </div>
       )}
+
+      <TradeTracker
+        ref={tradeTrackerRef}
+        currentStrategy={strategy}
+        currentRunId={runId}
+        currentTechnical={technical}
+        currentOI={oi}
+        currentGreeks={greeks}
+      />
 
       <div className="text-center text-gray-700 text-xs py-2">
         Nifty Options Advisor · For educational purposes only · Not financial advice

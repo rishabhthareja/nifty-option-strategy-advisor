@@ -54,9 +54,28 @@ CREATE TABLE IF NOT EXISTS trades (
     win_loss TEXT CHECK(win_loss IN ('WIN','LOSS','BREAKEVEN',NULL)),
     pnl_pct REAL,
     held_days INTEGER,
-    notes TEXT
+    notes TEXT,
+    pcr_at_entry REAL,
+    sell_call_oi_at_entry REAL,
+    sell_put_oi_at_entry REAL,
+    max_pain_at_entry REAL,
+    sell_call_delta_at_entry REAL,
+    sell_put_delta_at_entry REAL,
+    net_theta_at_entry REAL,
+    net_vega_at_entry REAL
 );
 """
+
+_TRADE_MIGRATION_COLUMNS = [
+    ("pcr_at_entry", "REAL"),
+    ("sell_call_oi_at_entry", "REAL"),
+    ("sell_put_oi_at_entry", "REAL"),
+    ("max_pain_at_entry", "REAL"),
+    ("sell_call_delta_at_entry", "REAL"),
+    ("sell_put_delta_at_entry", "REAL"),
+    ("net_theta_at_entry", "REAL"),
+    ("net_vega_at_entry", "REAL"),
+]
 
 _MARKS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_marks (
@@ -101,10 +120,21 @@ def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_trades_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    for col, col_type in _TRADE_MIGRATION_COLUMNS:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
+
+
 def init_db(db_path: Optional[Path] = None) -> None:
     conn = get_connection(db_path)
     try:
         conn.executescript(_TRADES_SCHEMA + _MARKS_SCHEMA)
+        _migrate_trades_columns(conn)
+        from services.review_store import _REVIEWS_SCHEMA
+
+        conn.executescript(_REVIEWS_SCHEMA)
         conn.commit()
     finally:
         conn.close()
@@ -230,6 +260,14 @@ def open_trade_from_request(
         range_position_at_entry=req.range_position_at_entry,
         spot_to_resistance_at_entry=req.spot_to_resistance_at_entry,
         spot_to_support_at_entry=req.spot_to_support_at_entry,
+        pcr_at_entry=req.pcr_at_entry,
+        sell_call_oi_at_entry=req.sell_call_oi_at_entry,
+        sell_put_oi_at_entry=req.sell_put_oi_at_entry,
+        max_pain_at_entry=req.max_pain_at_entry,
+        sell_call_delta_at_entry=req.sell_call_delta_at_entry,
+        sell_put_delta_at_entry=req.sell_put_delta_at_entry,
+        net_theta_at_entry=req.net_theta_at_entry,
+        net_vega_at_entry=req.net_vega_at_entry,
         notes=req.notes,
     )
     tid = create_trade(trade, db_path)
@@ -339,6 +377,25 @@ def get_latest_mark(
             (trade_id,),
         ).fetchone()
         return _row_to_mark(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_last_n_marks(
+    trade_id: str, n: int, db_path: Optional[Path] = None
+) -> List[DailyMark]:
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM daily_marks
+            WHERE trade_id = ? AND unrealized_pnl IS NOT NULL
+            ORDER BY mark_date DESC
+            LIMIT ?
+            """,
+            (trade_id, n),
+        ).fetchall()
+        return [_row_to_mark(r) for r in rows]
     finally:
         conn.close()
 

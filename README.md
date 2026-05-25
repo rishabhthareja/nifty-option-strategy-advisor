@@ -79,6 +79,14 @@ Frontend runs at http://localhost:5173
 | POST | `/trade/mark-all` | Auto-mark all open trades for today |
 | POST | `/trade/{trade_id}/close` | Close trade and record realized P&L |
 | GET | `/trade/stats` | Win rate, expectancy, totals |
+| GET | `/trade/reviews/pending` | Paper trades awaiting Sensibull/premium input |
+| POST | `/trade/review-now` | Manual position review (`MORNING` / `MIDDAY` / `EOD`) |
+| GET | `/trade/{trade_id}/reviews` | Review history for a trade |
+| GET | `/trade/{trade_id}/reviews/latest` | Latest completed (or pending) review |
+| GET | `/trade/{trade_id}/review-summary` | Entry vs latest review side-by-side |
+| POST | `/trade/{trade_id}/reviews/pending/complete` | Complete PAPER pending review (Sensibull snapshot) |
+
+Scheduled reviews (IST, weekdays 09:15–15:30): **10:30 MORNING**, **13:30 MIDDAY**, **15:00 EOD**.
 
 ## Strategies
 

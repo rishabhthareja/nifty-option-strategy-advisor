@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import uuid
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
+
+from models.compat import Literal
 
 from services.expiry_utils import ist_now
 
@@ -54,6 +56,18 @@ class TradeRecord(BaseModel):
     net_theta_at_entry: Optional[float] = None
     net_vega_at_entry: Optional[float] = None
 
+    atr_at_entry: Optional[float] = None
+    top_call_strikes_at_entry: Optional[str] = None
+    top_put_strikes_at_entry: Optional[str] = None
+    peak_call_oi_strike_at_entry: Optional[int] = None
+    peak_put_oi_strike_at_entry: Optional[int] = None
+    straddle_price_at_entry: Optional[float] = None
+
+    sell_put_entry_ltp: Optional[float] = None
+    buy_put_entry_ltp: Optional[float] = None
+    sell_call_entry_ltp: Optional[float] = None
+    buy_call_entry_ltp: Optional[float] = None
+
     exit_date: Optional[str] = None
     exit_spot: Optional[float] = None
     exit_premium: Optional[float] = None
@@ -76,7 +90,7 @@ class DailyMark(BaseModel):
     pnl_pct_of_max_profit: Optional[float] = None
     dte_remaining: Optional[int] = None
     iv_rank_today: Optional[float] = None
-    data_source: Literal["broker", "manual", "estimated"]
+    data_source: Literal["broker", "manual", "estimated", "chain_ltp"]
     exit_alert: str = "NONE"
     alert_detail: Optional[str] = None
     user_note: Optional[str] = None
@@ -137,6 +151,16 @@ class TradeOpenRequest(BaseModel):
     sell_put_delta_at_entry: Optional[float] = None
     net_theta_at_entry: Optional[float] = None
     net_vega_at_entry: Optional[float] = None
+    atr_at_entry: Optional[float] = None
+    top_call_strikes_at_entry: Optional[str] = None
+    top_put_strikes_at_entry: Optional[str] = None
+    peak_call_oi_strike_at_entry: Optional[int] = None
+    peak_put_oi_strike_at_entry: Optional[int] = None
+    straddle_price_at_entry: Optional[float] = None
+    sell_put_entry_ltp: Optional[float] = None
+    buy_put_entry_ltp: Optional[float] = None
+    sell_call_entry_ltp: Optional[float] = None
+    buy_call_entry_ltp: Optional[float] = None
     notes: Optional[str] = None
 
 
@@ -145,7 +169,7 @@ class TradeMarkRequest(BaseModel):
     spot: Optional[float] = None
     iv_rank: Optional[float] = None
     user_note: Optional[str] = None
-    data_source: Literal["broker", "manual", "estimated"] = "manual"
+    data_source: Literal["broker", "manual", "estimated", "chain_ltp"] = "manual"
 
 
 class TradeCloseRequest(BaseModel):

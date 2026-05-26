@@ -51,12 +51,104 @@ def _leg_close_price(chain: pd.DataFrame, strike: int, side: str, action: str) -
     return ltp
 
 
-def fetch_current_premium(trade: TradeRecord) -> dict:
-    """
-    Fetch cost-to-close from OpenAlgo option chain for trade expiry + strikes.
+def _extract_position_greeks(chain: pd.DataFrame, trade: TradeRecord) -> dict:
+    """Extract current net Greeks from chain for the 4 position legs."""
 
-    Returns dict with current_premium, data_source ('broker' or None), fetch_error.
+    def get_greek(strike, side, col):
+        if strike is None:
+            return None
+        prefix = "put" if side == "put" else "call"
+        row = chain[chain["strike"] == strike]
+        if row.empty:
+            row = chain.iloc[(chain["strike"] - strike).abs().argsort()[:1]]
+        try:
+            return float(row.iloc[0].get(f"{prefix}_{col}") or 0)
+        except (TypeError, ValueError):
+            return None
+
+    sc_delta = get_greek(trade.sell_call_strike, "call", "delta")
+    sp_delta = get_greek(trade.sell_put_strike, "put", "delta")
+    bc_delta = get_greek(trade.buy_call_strike, "call", "delta")
+    bp_delta = get_greek(trade.buy_put_strike, "put", "delta")
+
+    sc_theta = get_greek(trade.sell_call_strike, "call", "theta")
+    sp_theta = get_greek(trade.sell_put_strike, "put", "theta")
+    bc_theta = get_greek(trade.buy_call_strike, "call", "theta")
+    bp_theta = get_greek(trade.buy_put_strike, "put", "theta")
+
+    deltas = [d for d in [sc_delta, sp_delta, bc_delta, bp_delta] if d is not None]
+    net_theta = 0.0
+    for val, sign in [(sc_theta, -1), (sp_theta, -1), (bc_theta, 1), (bp_theta, 1)]:
+        if val is not None:
+            net_theta += sign * val
+
+    return {
+        "sell_call_delta": sc_delta,
+        "sell_put_delta": sp_delta,
+        "net_delta": round(sum(deltas), 4) if deltas else None,
+        "net_theta": round(net_theta, 2),
+    }
+
+
+def _price_legs_from_chain(chain: pd.DataFrame, trade: TradeRecord) -> Optional[float]:
+    legs = []
+    if trade.sell_put_strike and trade.buy_put_strike:
+        legs.append(("put", trade.sell_put_strike, "buy_to_close"))
+        legs.append(("put", trade.buy_put_strike, "sell_to_close"))
+    if trade.sell_call_strike and trade.buy_call_strike:
+        legs.append(("call", trade.sell_call_strike, "buy_to_close"))
+        legs.append(("call", trade.buy_call_strike, "sell_to_close"))
+    if not legs:
+        return None
+
+    total = 0.0
+    for side, strike, action in legs:
+        px = _leg_close_price(chain, int(strike), side, action)
+        if action == "buy_to_close":
+            total += px
+        else:
+            total -= px
+    if total < 0:
+        return None
+    return round(total, 2)
+
+
+def fetch_current_premium(
+    trade: TradeRecord,
+    chain: pd.DataFrame | None = None,
+) -> dict:
     """
+    Fetch cost-to-close from pre-fetched chain or OpenAlgo for trade expiry + strikes.
+
+    Returns dict with current_premium, data_source, fetch_error, optional current_greeks.
+    """
+    if chain is not None and not chain.empty:
+        is_mock = getattr(chain, "attrs", {}).get("source") == "mock"
+        if is_mock:
+            return {
+                "current_premium": None,
+                "data_source": None,
+                "fetch_error": "Chain is mock — skipping",
+                "is_mock": True,
+            }
+
+        total = _price_legs_from_chain(chain, trade)
+        if total is None:
+            return {
+                "current_premium": None,
+                "data_source": None,
+                "fetch_error": "Could not price all legs from chain",
+            }
+
+        greeks = _extract_position_greeks(chain, trade)
+        return {
+            "current_premium": total,
+            "data_source": "chain_ltp",
+            "fetch_error": None,
+            "is_mock": False,
+            "current_greeks": greeks,
+        }
+
     try:
         svc = OpenAlgoService()
         if not svc._connected:
@@ -66,44 +158,22 @@ def fetch_current_premium(trade: TradeRecord) -> dict:
                 "fetch_error": "OpenAlgo not connected",
             }
 
-        chain = svc.get_options_chain(expiry=trade.expiry_date)
-        if chain is None or chain.empty:
+        broker_chain = svc.get_options_chain(expiry=trade.expiry_date)
+        if broker_chain is None or broker_chain.empty:
             return {
                 "current_premium": None,
                 "data_source": None,
                 "fetch_error": "Empty option chain",
             }
-        if getattr(chain, "attrs", {}).get("source") == "mock":
+        if getattr(broker_chain, "attrs", {}).get("source") == "mock":
             return {
                 "current_premium": None,
                 "data_source": None,
                 "fetch_error": "Chain is mock — cannot mark LIVE from broker",
             }
 
-        legs = []
-        if trade.sell_put_strike and trade.buy_put_strike:
-            legs.append(("put", trade.sell_put_strike, "buy_to_close"))
-            legs.append(("put", trade.buy_put_strike, "sell_to_close"))
-        if trade.sell_call_strike and trade.buy_call_strike:
-            legs.append(("call", trade.sell_call_strike, "buy_to_close"))
-            legs.append(("call", trade.buy_call_strike, "sell_to_close"))
-
-        if not legs:
-            return {
-                "current_premium": None,
-                "data_source": None,
-                "fetch_error": "No leg strikes on trade",
-            }
-
-        total = 0.0
-        for side, strike, action in legs:
-            px = _leg_close_price(chain, int(strike), side, action)
-            if action == "buy_to_close":
-                total += px
-            else:
-                total -= px
-
-        if total <= 0:
+        total = _price_legs_from_chain(broker_chain, trade)
+        if total is None:
             return {
                 "current_premium": None,
                 "data_source": None,
@@ -111,7 +181,7 @@ def fetch_current_premium(trade: TradeRecord) -> dict:
             }
 
         return {
-            "current_premium": round(total, 2),
+            "current_premium": total,
             "data_source": "broker",
             "fetch_error": None,
         }
@@ -213,12 +283,13 @@ def build_mark_for_trade(
     src = data_source
     fetch_error = None
 
-    if premium is None and fetch_if_missing and trade.trade_type == "LIVE":
+    if premium is None and fetch_if_missing:
         fr = fetch_current_premium(trade)
-        if fr.get("data_source") == "broker" and fr.get("current_premium") is not None:
+        src_name = fr.get("data_source")
+        if src_name in ("broker", "chain_ltp") and fr.get("current_premium") is not None:
             premium = fr["current_premium"]
-            src = "broker"
-        else:
+            src = src_name
+        elif trade.trade_type == "LIVE":
             fetch_error = fr.get("fetch_error")
 
     if premium is None and trade.trade_type == "PAPER":
@@ -372,3 +443,104 @@ def auto_mark_open_trades(
         "trades_needing_mark": needing,
         "alerts": alerts,
     }
+
+
+def list_open_live_trades_for_monitoring() -> List[TradeRecord]:
+    """OPEN LIVE trades with expiry on or after today (non-expired)."""
+    open_live = trade_store.list_trades(trade_type="LIVE", status="OPEN")
+    return [t for t in open_live if days_to_expiry(t.expiry_date) >= 0]
+
+
+def auto_create_paper_trade(
+    strategy,
+    oi,
+    greeks,
+    chain: pd.DataFrame,
+    market,
+    run_id: str,
+    technical=None,
+) -> dict:
+    """
+    Auto-create a paper trade from a completed strategy recommendation.
+    Returns {"trade_id": str} on success or {"skipped": reason} if not applicable.
+    """
+    from config import AUTO_PAPER_TRADE
+    from models.trade import TradeOpenRequest
+    from services.chain_utils import lot_size_from_chain
+    from services.trade_entry_snapshot import entry_enrichment_from_agents
+
+    if not AUTO_PAPER_TRADE:
+        return {"skipped": "AUTO_PAPER_TRADE disabled"}
+
+    if strategy.strategy == "WAIT":
+        return {"skipped": "Strategy is WAIT"}
+
+    entry_premium = getattr(strategy, "conservative_net_premium", None) or strategy.net_premium
+    if not entry_premium or entry_premium <= 0:
+        return {"skipped": "No valid entry premium"}
+
+    expiry = strategy.option_expiry or getattr(chain, "attrs", {}).get("expiry")
+    if not expiry:
+        return {"skipped": "No expiry on strategy"}
+
+    open_papers = trade_store.list_trades(trade_type="PAPER", status="OPEN")
+    for t in open_papers:
+        if (
+            t.expiry_date == expiry
+            and t.sell_call_strike == strategy.sell_call_strike
+            and t.sell_put_strike == strategy.sell_put_strike
+        ):
+            return {"skipped": f"Duplicate paper trade already open: {t.trade_id}"}
+
+    def get_ltp(strike, side):
+        if strike is None or chain is None or chain.empty:
+            return None
+        prefix = "put" if side == "put" else "call"
+        row = chain[chain["strike"] == strike]
+        if row.empty:
+            return None
+        try:
+            return float(row.iloc[0].get(f"{prefix}_ltp") or 0)
+        except (TypeError, ValueError):
+            return None
+
+    enrichment = entry_enrichment_from_agents(technical=technical, oi=oi, greeks=greeks)
+
+    req = TradeOpenRequest(
+        trade_type="PAPER",
+        run_id=run_id,
+        entry_spot=market.nifty_spot,
+        expiry_date=expiry,
+        dte_at_entry=strategy.days_to_expiry or 0,
+        strategy=strategy.strategy,
+        sell_put_strike=strategy.sell_put_strike,
+        buy_put_strike=strategy.buy_put_strike,
+        sell_call_strike=strategy.sell_call_strike,
+        buy_call_strike=strategy.buy_call_strike,
+        entry_premium=entry_premium,
+        max_profit=getattr(strategy, "conservative_max_profit", None) or strategy.max_profit or 0,
+        max_loss=getattr(strategy, "conservative_max_loss", None) or strategy.max_loss or 0,
+        lower_breakeven=getattr(strategy, "conservative_lower_breakeven", None)
+        or strategy.lower_breakeven,
+        upper_breakeven=getattr(strategy, "conservative_upper_breakeven", None)
+        or strategy.upper_breakeven,
+        lot_size=lot_size_from_chain(chain),
+        num_lots=1,
+        iv_rank_at_entry=getattr(strategy, "iv_rank_snapshot", None),
+        vix_at_entry=market.vix,
+        pop_at_entry=strategy.est_pop_pct,
+        reward_risk_at_entry=strategy.reward_risk,
+        theta_per_day_at_entry=getattr(strategy, "theta_per_day", None),
+        pcr_at_entry=getattr(strategy, "pcr_snapshot", None),
+        range_position_at_entry=getattr(strategy, "range_position", None),
+        spot_to_resistance_at_entry=getattr(strategy, "spot_to_resistance_pts", None),
+        spot_to_support_at_entry=getattr(strategy, "spot_to_support_pts", None),
+        sell_put_entry_ltp=get_ltp(strategy.sell_put_strike, "put"),
+        sell_call_entry_ltp=get_ltp(strategy.sell_call_strike, "call"),
+        buy_put_entry_ltp=get_ltp(strategy.buy_put_strike, "put"),
+        buy_call_entry_ltp=get_ltp(strategy.buy_call_strike, "call"),
+        **enrichment,
+    )
+
+    trade_id, warning = trade_store.open_trade_from_request(req)
+    return {"trade_id": trade_id, "warning": warning}

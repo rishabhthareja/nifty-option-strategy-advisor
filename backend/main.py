@@ -40,14 +40,19 @@ from models.review import PendingReviewCompleteRequest, ReviewNowRequest
 from services import trade_store
 from services.expiry_utils import ist_now
 from services.position_monitor import (
+    auto_create_paper_trade,
     auto_mark_open_trades,
     build_mark_for_trade,
+    calculate_unrealized_pnl,
     close_trade_record,
+    fetch_current_premium,
+    list_open_live_trades_for_monitoring,
 )
 from services.position_review import (
     build_review_summary,
     complete_pending_review,
     run_position_review,
+    run_position_review_with_data,
 )
 from services import review_store
 from services.scheduler import start_scheduler, stop_scheduler
@@ -260,6 +265,64 @@ async def analyse_stream():
             results["greeks"] = greeks_payload
             yield await _sse_event({"agent": "greeks", "status": "done", "data": greeks_payload, "elapsed": round(elapsed, 2)})
 
+            # ── Open trade detection — monitoring mode if live trade exists ──
+            _open_live = list_open_live_trades_for_monitoring()
+
+            if _open_live:
+                yield await _sse_event({
+                    "agent": "mode",
+                    "mode": "MONITORING",
+                    "open_trade_count": len(_open_live),
+                })
+
+                _monitoring_results = []
+                for _trade in _open_live:
+                    try:
+                        _review = run_position_review_with_data(
+                            trade=_trade,
+                            market_data=market,
+                            technical=technical,
+                            oi=oi,
+                            chain=chain,
+                            check_slot="MIDDAY",
+                        )
+                        _pnl_result = fetch_current_premium(_trade, chain=chain)
+                        _pnl = (
+                            calculate_unrealized_pnl(_trade, _pnl_result["current_premium"])
+                            if _pnl_result.get("current_premium") is not None
+                            else None
+                        )
+                        _monitoring_results.append({
+                            "trade": _safe_dict(_trade),
+                            "review": _safe_dict(_review) if _review else None,
+                            "current_premium": _pnl_result.get("current_premium"),
+                            "current_greeks": _pnl_result.get("current_greeks"),
+                            "unrealized_pnl": _pnl,
+                        })
+                    except Exception as _e:
+                        _monitoring_results.append({
+                            "trade": _safe_dict(_trade),
+                            "error": str(_e),
+                        })
+
+                yield await _sse_event({
+                    "agent": "monitoring",
+                    "status": "done",
+                    "data": _monitoring_results,
+                })
+                journal = build_master_journal(logger.agent_outputs, market.nifty_spot)
+                logger.save_master(journal=journal)
+                yield await _sse_event({
+                    "agent": "complete",
+                    "run_id": run_id,
+                    "mode": "MONITORING",
+                    "monitoring_results": _monitoring_results,
+                })
+                return
+
+            # ── No open live trades — normal entry analysis mode ─────────────
+            yield await _sse_event({"agent": "mode", "mode": "ENTRY"})
+
             # ── Strategy ─────────────────────────────────────────────────────
             yield await _sse_event({"agent": "strategy", "status": "running"})
             funds = OpenAlgoService().get_funds()
@@ -363,12 +426,31 @@ async def analyse_stream():
             )
             _pending_order_details[run_id] = order_details
 
+            from config import AUTO_PAPER_TRADE as _APT
+
+            _paper_result = None
+            if _APT and strategy.strategy != "WAIT":
+                try:
+                    _paper_result = auto_create_paper_trade(
+                        strategy=strategy,
+                        oi=oi,
+                        greeks=greeks,
+                        chain=chain,
+                        market=market,
+                        run_id=run_id,
+                        technical=technical,
+                    )
+                except Exception as _e:
+                    _paper_result = {"skipped": f"Error: {_e}"}
+
             yield await _sse_event({
                 "agent": "complete",
                 "run_id": run_id,
+                "mode": "ENTRY",
                 "strategy": _safe_dict(strategy),
                 "evaluation": _safe_dict(evaluation) if evaluation is not None else results.get("evaluator"),
                 "order_details": _safe_dict(order_details),
+                "auto_paper_trade": _paper_result,
             })
 
         except Exception as e:

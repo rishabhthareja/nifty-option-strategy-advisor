@@ -75,6 +75,16 @@ _TRADE_MIGRATION_COLUMNS = [
     ("sell_put_delta_at_entry", "REAL"),
     ("net_theta_at_entry", "REAL"),
     ("net_vega_at_entry", "REAL"),
+    ("atr_at_entry", "REAL"),
+    ("top_call_strikes_at_entry", "TEXT"),
+    ("top_put_strikes_at_entry", "TEXT"),
+    ("peak_call_oi_strike_at_entry", "INTEGER"),
+    ("peak_put_oi_strike_at_entry", "INTEGER"),
+    ("straddle_price_at_entry", "REAL"),
+    ("sell_put_entry_ltp", "REAL"),
+    ("buy_put_entry_ltp", "REAL"),
+    ("sell_call_entry_ltp", "REAL"),
+    ("buy_call_entry_ltp", "REAL"),
 ]
 
 _MARKS_SCHEMA = """
@@ -88,7 +98,7 @@ CREATE TABLE IF NOT EXISTS daily_marks (
     pnl_pct_of_max_profit REAL,
     dte_remaining INTEGER,
     iv_rank_today REAL,
-    data_source TEXT NOT NULL CHECK(data_source IN ('broker','manual','estimated')),
+    data_source TEXT NOT NULL CHECK(data_source IN ('broker','manual','estimated','chain_ltp')),
     exit_alert TEXT CHECK(exit_alert IN (
         'NONE','PROFIT_TARGET_HIT','STOP_LOSS_HIT',
         'DAY4_CLOSE','BREACH_PUT','BREACH_CALL'
@@ -127,14 +137,55 @@ def _migrate_trades_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
 
 
+def _migrate_marks_data_source(conn: sqlite3.Connection) -> None:
+    """Recreate daily_marks if CHECK constraint lacks chain_ltp (SQLite cannot ALTER CHECK)."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_marks'"
+    ).fetchone()
+    if not row or not row[0]:
+        return
+    if "chain_ltp" in row[0]:
+        return
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS daily_marks_new (
+            mark_id TEXT PRIMARY KEY,
+            trade_id TEXT NOT NULL REFERENCES trades(trade_id),
+            mark_date TEXT NOT NULL,
+            spot REAL,
+            current_premium REAL,
+            unrealized_pnl REAL,
+            pnl_pct_of_max_profit REAL,
+            dte_remaining INTEGER,
+            iv_rank_today REAL,
+            data_source TEXT NOT NULL CHECK(data_source IN ('broker','manual','estimated','chain_ltp')),
+            exit_alert TEXT CHECK(exit_alert IN (
+                'NONE','PROFIT_TARGET_HIT','STOP_LOSS_HIT',
+                'DAY4_CLOSE','BREACH_PUT','BREACH_CALL'
+            )),
+            alert_detail TEXT,
+            user_note TEXT,
+            marked_at TEXT NOT NULL,
+            UNIQUE(trade_id, mark_date)
+        );
+        INSERT INTO daily_marks_new SELECT * FROM daily_marks;
+        DROP TABLE daily_marks;
+        ALTER TABLE daily_marks_new RENAME TO daily_marks;
+        """
+    )
+
+
 def init_db(db_path: Optional[Path] = None) -> None:
     conn = get_connection(db_path)
     try:
         conn.executescript(_TRADES_SCHEMA + _MARKS_SCHEMA)
         _migrate_trades_columns(conn)
-        from services.review_store import _REVIEWS_SCHEMA
+        _migrate_marks_data_source(conn)
+        from services.review_store import _REVIEWS_SCHEMA, _migrate_review_columns
 
         conn.executescript(_REVIEWS_SCHEMA)
+        _migrate_review_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -268,6 +319,16 @@ def open_trade_from_request(
         sell_put_delta_at_entry=req.sell_put_delta_at_entry,
         net_theta_at_entry=req.net_theta_at_entry,
         net_vega_at_entry=req.net_vega_at_entry,
+        atr_at_entry=req.atr_at_entry,
+        top_call_strikes_at_entry=req.top_call_strikes_at_entry,
+        top_put_strikes_at_entry=req.top_put_strikes_at_entry,
+        peak_call_oi_strike_at_entry=req.peak_call_oi_strike_at_entry,
+        peak_put_oi_strike_at_entry=req.peak_put_oi_strike_at_entry,
+        straddle_price_at_entry=req.straddle_price_at_entry,
+        sell_put_entry_ltp=req.sell_put_entry_ltp,
+        buy_put_entry_ltp=req.buy_put_entry_ltp,
+        sell_call_entry_ltp=req.sell_call_entry_ltp,
+        buy_call_entry_ltp=req.buy_call_entry_ltp,
         notes=req.notes,
     )
     tid = create_trade(trade, db_path)
@@ -341,6 +402,41 @@ def add_daily_mark(mark: DailyMark, db_path: Optional[Path] = None) -> str:
             f"INSERT INTO daily_marks ({','.join(cols)}) VALUES ({placeholders})",
             [data[c] for c in cols],
         )
+
+        trade = get_trade(mark.trade_id, db_path)
+        if trade and trade.status == "OPEN" and mark.dte_remaining is not None:
+            if mark.dte_remaining < 0:
+                update_trade_status(trade.trade_id, "EXPIRED", db_path)
+
+        conn.commit()
+        return mark.mark_id
+    finally:
+        conn.close()
+
+
+def upsert_daily_mark(mark: DailyMark, db_path: Optional[Path] = None) -> str:
+    """Insert or update today's mark (used by hourly paper P&L refresh)."""
+    init_db(db_path)
+    conn = get_connection(db_path)
+    try:
+        existing = conn.execute(
+            "SELECT mark_id FROM daily_marks WHERE trade_id = ? AND mark_date = ?",
+            (mark.trade_id, mark.mark_date),
+        ).fetchone()
+        data = mark.model_dump()
+        if existing:
+            mark.mark_id = existing["mark_id"]
+            data["mark_id"] = existing["mark_id"]
+            sets = ", ".join(f"{k} = ?" for k in data if k != "mark_id")
+            vals = [data[k] for k in data if k != "mark_id"] + [mark.mark_id]
+            conn.execute(f"UPDATE daily_marks SET {sets} WHERE mark_id = ?", vals)
+        else:
+            cols = list(data.keys())
+            placeholders = ",".join("?" * len(cols))
+            conn.execute(
+                f"INSERT INTO daily_marks ({','.join(cols)}) VALUES ({placeholders})",
+                [data[c] for c in cols],
+            )
 
         trade = get_trade(mark.trade_id, db_path)
         if trade and trade.status == "OPEN" and mark.dte_remaining is not None:

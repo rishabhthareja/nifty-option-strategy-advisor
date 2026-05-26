@@ -15,6 +15,9 @@ OPENALGO_CHAIN_TIMEOUT_SECS = float(os.getenv("OPENALGO_CHAIN_TIMEOUT_SECS", "90
 LIVE_DATA_CACHE_SECS = float(os.getenv("LIVE_DATA_CACHE_SECS", "15"))
 ENABLE_LIVE_ORDERS = os.getenv("ENABLE_LIVE_ORDERS", "false").lower() == "true"
 
+# Paper trading automation
+AUTO_PAPER_TRADE = os.getenv("AUTO_PAPER_TRADE", "true").lower() == "true"
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 

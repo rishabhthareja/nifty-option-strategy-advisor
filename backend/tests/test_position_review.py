@@ -66,6 +66,12 @@ def _open_ic(db_path, trade_type="PAPER", run_id="r1", **extra) -> str:
         sell_call_delta_at_entry=0.15,
         sell_put_delta_at_entry=-0.15,
         net_theta_at_entry=100.0,
+        atr_at_entry=200.0,
+        straddle_price_at_entry=300.0,
+        top_call_strikes_at_entry='[{"strike": 24500, "oi": 200000}]',
+        top_put_strikes_at_entry='[{"strike": 23500, "oi": 150000}]',
+        peak_call_oi_strike_at_entry=24500,
+        peak_put_oi_strike_at_entry=23500,
     )
     fields.update(extra)
     req = TradeOpenRequest(**fields)
@@ -137,15 +143,23 @@ def test_run_position_review_morning_breach_fires_hard_exit(db_path):
 
 
 @patch("services.position_review.fetch_review_market_data")
-def test_run_position_review_midday_soft_exit_paper_creates_pending(mock_batch, db_path):
+@patch(
+    "agents.position_review_llm.generate_correlated_reasoning",
+    return_value="Degraded review — spot and OI only.",
+)
+def test_run_position_review_midday_paper_degraded_completed(mock_llm, mock_batch, db_path):
     mock_batch.return_value = _mock_batch(spot=24000.0, iv_rank=20.0)
     tid = _open_ic(db_path, trade_type="PAPER")
-    with patch("services.position_review.fetch_current_premium", return_value={"current_premium": None}):
+    with patch(
+        "services.position_review.fetch_current_premium",
+        return_value={"current_premium": None},
+    ):
         result = run_position_review("MIDDAY", trade_id=tid, bypass_session=True)
     assert not result.get("skipped")
-    pending = review_store.get_latest_pending_review(tid, db_path)
-    assert pending is not None
-    assert pending.review_status == "PENDING_INPUT"
+    latest = review_store.get_latest_completed_review(tid, db_path)
+    assert latest is not None
+    assert latest.review_status == "COMPLETED"
+    assert latest.move_class is not None
 
 
 def test_pending_review_completed_with_manual_premium(db_path):
@@ -162,7 +176,10 @@ def test_pending_review_completed_with_manual_premium(db_path):
         cushion_put_today=500.0,
     )
     review_store.upsert_review(review, db_path)
-    with patch("agents.position_review_llm.generate_soft_exit_reasoning", return_value="Consider closing."):
+    with patch(
+        "agents.position_review_llm.generate_correlated_reasoning",
+        return_value="Consider closing.",
+    ):
         out = complete_pending_review(
             tid,
             PendingReviewCompleteRequest(current_premium=40.0),

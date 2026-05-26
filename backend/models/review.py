@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import uuid
-from typing import List, Literal, Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
+
+from models.compat import Literal
 
 from services.expiry_utils import ist_now
 
@@ -13,6 +15,17 @@ CheckSlot = Literal["MORNING", "MIDDAY", "EOD"]
 ReviewStatus = Literal["COMPLETED", "PENDING_INPUT", "SKIPPED"]
 ExitSignal = Literal["HARD_EXIT", "SOFT_EXIT", "HOLD"]
 RecommendedAction = Literal["CLOSE", "REVIEW", "HOLD"]
+ActionCategory = Literal[
+    "CLOSE_FULL",
+    "CLOSE_CALL_SIDE",
+    "CLOSE_PUT_SIDE",
+    "TAKE_PROFIT",
+    "TIGHTEN_STOPS",
+    "WATCH_CLOSELY",
+    "HOLD",
+]
+ActionConfidence = Literal["HIGH", "MEDIUM", "LOW"]
+MoveClass = Literal["NOISE", "MEANINGFUL", "SIGNIFICANT", "EXTREME"]
 
 
 class SnapshotLeg(BaseModel):
@@ -105,6 +118,20 @@ class PositionReview(BaseModel):
     delta_signal: Optional[str] = None
     theta_signal: Optional[str] = None
     vega_signal: Optional[str] = None
+
+    move_vs_expected: Optional[float] = None
+    move_class: Optional[MoveClass] = None
+    daily_expected_move: Optional[float] = None
+    theta_delta_ratio: Optional[float] = None
+    theta_compensating: Optional[bool] = None
+    oi_call_classification: Optional[str] = None
+    oi_call_confidence: Optional[float] = None
+    oi_put_classification: Optional[str] = None
+    oi_put_confidence: Optional[float] = None
+    action_category: Optional[ActionCategory] = None
+    action_confidence: Optional[ActionConfidence] = None
+    evidence_list: List[str] = Field(default_factory=list)
+    pending_greeks: bool = False
 
     snapshot_raw: Optional[str] = None
     created_at: str = Field(default_factory=lambda: ist_now().isoformat())

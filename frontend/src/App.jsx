@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import TradeTracker from './components/TradeTracker'
 import LiveTicker from './components/LiveTicker'
 import AgentPipeline from './components/AgentPipeline'
@@ -8,9 +8,10 @@ import GreeksTable from './components/GreeksTable'
 import StrategyCard from './components/StrategyCard'
 import EvaluatorPanel from './components/EvaluatorPanel'
 import HITLPanel from './components/HITLPanel'
+import PositionMonitorPanel from './components/PositionMonitorPanel'
 import JsonViewer from './components/JsonViewer'
 import AnalysisErrorBanner from './components/AnalysisErrorBanner'
-import { startAnalysis } from './api'
+import { startAnalysis, listTrades } from './api'
 import { parseAnalysisError } from './utils/parseAnalysisError'
 
 const AGENT_KEYS = ['market_data', 'technical', 'options_chain', 'oi_analysis', 'greeks', 'strategy', 'evaluator']
@@ -23,8 +24,18 @@ export default function App() {
   const [runId, setRunId] = useState(null)
   const [startTime, setStartTime] = useState(null)
   const [error, setError] = useState(null)
+  const [analysisMode, setAnalysisMode] = useState('ENTRY')
+  const [monitoringResults, setMonitoringResults] = useState([])
+  const [autoPaperTradeId, setAutoPaperTradeId] = useState(null)
+  const [journalTrades, setJournalTrades] = useState([])
   const esRef = useRef(null)
   const tradeTrackerRef = useRef(null)
+
+  useEffect(() => {
+    listTrades()
+      .then((r) => setJournalTrades(r.trades || []))
+      .catch(() => {})
+  }, [isComplete, autoPaperTradeId])
 
   const handleStart = () => {
     if (isRunning) return
@@ -35,13 +46,16 @@ export default function App() {
     setError(null)
     setRunId(null)
     setAgentData({})
+    setAnalysisMode('ENTRY')
+    setMonitoringResults([])
+    setAutoPaperTradeId(null)
     const initialStates = {}
     AGENT_KEYS.forEach(k => { initialStates[k] = 'waiting' })
     setAgentStates(initialStates)
     setStartTime(Date.now())
 
     const es = startAnalysis((event) => {
-      const { agent, status, data, elapsed, run_id, strategy, evaluation } = event
+      const { agent, status, data, elapsed, run_id, strategy, evaluation, mode } = event
 
       if (agent === 'error') {
         setError(parseAnalysisError(event))
@@ -50,8 +64,30 @@ export default function App() {
         return
       }
 
+      if (agent === 'mode') {
+        setAnalysisMode(event.mode)
+        return
+      }
+
+      if (agent === 'monitoring') {
+        setMonitoringResults(data || [])
+        return
+      }
+
       if (agent === 'complete') {
         setRunId(run_id)
+        if (mode === 'MONITORING') {
+          setMonitoringResults(event.monitoring_results || [])
+          setAnalysisMode('MONITORING')
+          setIsRunning(false)
+          setIsComplete(true)
+          es.close()
+          return
+        }
+        if (event.auto_paper_trade?.trade_id) {
+          setAutoPaperTradeId(event.auto_paper_trade.trade_id)
+          tradeTrackerRef.current?.refresh()
+        }
         const evalPayload =
           evaluation?.status === 'skipped'
             ? { status: 'skipped', reason: evaluation.reason || 'pre_flight' }
@@ -61,6 +97,7 @@ export default function App() {
           strategy: strategy,
           evaluator: evalPayload,
         }))
+        setAnalysisMode(mode || 'ENTRY')
         setIsRunning(false)
         setIsComplete(true)
         es.close()
@@ -111,8 +148,12 @@ export default function App() {
   const greeks = agentData.greeks
   const strategy = agentData.strategy
   const evaluation = agentData.evaluator
+  const hasOpenLive = journalTrades.some(
+    (t) => t.status === 'OPEN' && t.trade_type === 'LIVE',
+  )
+  const refreshPositionLabel =
+    analysisMode === 'MONITORING' && hasOpenLive
 
-  // Reconstruct chain data for heatmap from oi analysis top strikes
   const chainForHeatmap = oi ? [
     ...(oi.top_put_strikes || []).map(s => ({ strike: s.strike, put_oi: s.oi, call_oi: 0 })),
     ...(oi.top_call_strikes || []).map(s => ({ strike: s.strike, put_oi: 0, call_oi: s.oi })),
@@ -159,7 +200,11 @@ export default function App() {
                 : 'bg-blue-600 hover:bg-blue-500 text-white'
             }`}
           >
-            {isRunning ? '■ Stop' : '▶ Run Analysis'}
+            {isRunning
+              ? '■ Stop'
+              : refreshPositionLabel
+                ? '🔍 Refresh Position'
+                : '▶ Run Analysis'}
           </button>
         </div>
       </div>
@@ -195,33 +240,51 @@ export default function App() {
             </div>
           </div>
 
-          {/* Row 2: Strategy + Evaluator */}
-          <div className="grid grid-cols-12 gap-4">
-            <div className="col-span-6">
-              <StrategyCard data={strategy} />
-            </div>
-            <div className="col-span-6">
-              <EvaluatorPanel data={evaluation} strategy={strategy} />
-            </div>
-          </div>
-
-          {/* HITL Panel */}
-          {isComplete && (
-            <HITLPanel
-              runId={runId}
-              strategy={strategy}
-              evaluation={evaluation}
-              market={market}
-              oi={oi}
-              greeks={greeks}
-              technical={technical}
-              onDecision={(d) => console.log('Decision:', d)}
-              onPaperTradeOpened={() => tradeTrackerRef.current?.refresh()}
+          {/* Row 2: Strategy + Evaluator OR Position Monitor */}
+          {analysisMode === 'MONITORING' && isComplete ? (
+            <PositionMonitorPanel
+              results={monitoringResults}
+              onTradeClosed={() => {
+                tradeTrackerRef.current?.refresh()
+                listTrades().then((r) => setJournalTrades(r.trades || [])).catch(() => {})
+              }}
             />
+          ) : (
+            <>
+              <div className="grid grid-cols-12 gap-4">
+                <div className="col-span-6">
+                  <StrategyCard data={strategy} />
+                </div>
+                <div className="col-span-6">
+                  <EvaluatorPanel data={evaluation} strategy={strategy} />
+                </div>
+              </div>
+
+              {isComplete && (
+                <HITLPanel
+                  runId={runId}
+                  strategy={strategy}
+                  evaluation={evaluation}
+                  market={market}
+                  oi={oi}
+                  greeks={greeks}
+                  technical={technical}
+                  onDecision={(d) => console.log('Decision:', d)}
+                  onPaperTradeOpened={() => tradeTrackerRef.current?.refresh()}
+                />
+              )}
+
+              {autoPaperTradeId && (
+                <div className="bg-gray-900 border border-gray-700 rounded-lg p-3 text-xs text-gray-400">
+                  📋 Paper trade auto-created — ID:{' '}
+                  <span className="text-blue-400 font-mono">{autoPaperTradeId}</span>
+                </div>
+              )}
+            </>
           )}
 
           {/* JSON Viewer */}
-          {isComplete && (
+          {isComplete && analysisMode !== 'MONITORING' && (
             <div className="space-y-2">
               <h2 className="text-sm font-bold text-gray-500 uppercase tracking-widest">Raw Agent Outputs</h2>
               {Object.entries(jsonViewerData).map(([key, data]) =>

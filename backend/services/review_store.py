@@ -71,6 +71,29 @@ CREATE TABLE IF NOT EXISTS position_reviews (
 );
 """
 
+_REVIEW_MIGRATION_COLUMNS = [
+    ("move_vs_expected", "REAL"),
+    ("move_class", "TEXT"),
+    ("daily_expected_move", "REAL"),
+    ("theta_delta_ratio", "REAL"),
+    ("theta_compensating", "INTEGER"),
+    ("oi_call_classification", "TEXT"),
+    ("oi_call_confidence", "REAL"),
+    ("oi_put_classification", "TEXT"),
+    ("oi_put_confidence", "REAL"),
+    ("action_category", "TEXT"),
+    ("action_confidence", "TEXT"),
+    ("evidence_list", "TEXT"),
+    ("pending_greeks", "INTEGER DEFAULT 0"),
+]
+
+
+def _migrate_review_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(position_reviews)").fetchall()}
+    for col, col_type in _REVIEW_MIGRATION_COLUMNS:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE position_reviews ADD COLUMN {col} {col_type}")
+
 
 def _row_to_review(row: sqlite3.Row) -> PositionReview:
     data = dict(row)
@@ -80,6 +103,16 @@ def _row_to_review(row: sqlite3.Row) -> PositionReview:
             data["exit_reason_codes"] = json.loads(codes) if codes else []
         except json.JSONDecodeError:
             data["exit_reason_codes"] = []
+    if data.get("theta_compensating") is not None:
+        data["theta_compensating"] = bool(data["theta_compensating"])
+    if data.get("pending_greeks") is not None:
+        data["pending_greeks"] = bool(data["pending_greeks"])
+    ev = data.get("evidence_list")
+    if isinstance(ev, str):
+        try:
+            data["evidence_list"] = json.loads(ev) if ev else []
+        except json.JSONDecodeError:
+            data["evidence_list"] = []
     data["reasoning_skipped"] = bool(data.get("reasoning_skipped"))
     return PositionReview(**data)
 
@@ -87,6 +120,10 @@ def _row_to_review(row: sqlite3.Row) -> PositionReview:
 def _review_to_row(review: PositionReview) -> dict:
     data = review.model_dump()
     data["exit_reason_codes"] = json.dumps(data.get("exit_reason_codes") or [])
+    data["evidence_list"] = json.dumps(data.get("evidence_list") or [])
+    if data.get("theta_compensating") is not None:
+        data["theta_compensating"] = 1 if data["theta_compensating"] else 0
+    data["pending_greeks"] = 1 if data.get("pending_greeks") else 0
     data["reasoning_skipped"] = 1 if data.get("reasoning_skipped") else 0
     return data
 

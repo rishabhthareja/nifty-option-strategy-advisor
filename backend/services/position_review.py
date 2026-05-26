@@ -11,7 +11,10 @@ import pandas as pd
 from agents.greeks import _get_strike_greeks
 from agents.oi_analysis import oi_analysis_agent
 from agents.options_chain import options_chain_agent
-from agents.position_review_llm import generate_soft_exit_reasoning
+from agents.position_review_llm import (
+    generate_correlated_reasoning,
+    generate_soft_exit_reasoning,
+)
 from agents.technical import technical_agent
 from models.market import MarketData
 from models.review import (
@@ -29,6 +32,12 @@ from services.position_monitor import (
     calculate_pnl_pct_of_max_profit,
     calculate_unrealized_pnl,
     fetch_current_premium,
+)
+from services.correlated_review import (
+    apply_move_fields,
+    compute_move_metrics,
+    map_action_to_exit,
+    run_correlated_midday_eod,
 )
 from services.openalgo_client import OpenAlgoService
 
@@ -57,7 +66,6 @@ SOFT_CODES = {
     "PCR_SHIFT",
     "CALL_OI_BUILDING",
     "PUT_WALL_COLLAPSING",
-    "MAX_PAIN_SHIFT",
     "DELTA_EXPANSION_CALL",
     "DELTA_EXPANSION_PUT",
     "THETA_COLLAPSED",
@@ -121,6 +129,63 @@ def fetch_review_market_data(
         "top_put_strikes": oi.top_put_strikes,
         "top_call_strikes": oi.top_call_strikes,
     }
+
+
+def batch_from_prefetched(
+    market,
+    technical,
+    oi,
+    chain,
+    *,
+    include_technical: bool = True,
+) -> dict[str, Any]:
+    """Build review batch dict from pipeline-fetched agent outputs."""
+    spot = float(market.nifty_spot)
+    vix = float(market.vix or 0)
+    tech = technical if include_technical else None
+    rsi = getattr(technical, "rsi", None) if include_technical and technical else None
+    bb_width = getattr(technical, "bb_width", None) if include_technical and technical else None
+    rp = range_position_metrics(spot, oi.support, oi.resistance)
+    return {
+        "market": market,
+        "chain": chain,
+        "oi": oi,
+        "technical": tech,
+        "spot": spot,
+        "vix": vix,
+        "iv_rank": oi.iv_rank,
+        "pcr": oi.pcr,
+        "max_pain": oi.max_pain,
+        "rsi": rsi,
+        "bb_width": bb_width,
+        "range_position": rp["range_position"],
+        "support": oi.support,
+        "resistance": oi.resistance,
+        "top_put_strikes": oi.top_put_strikes,
+        "top_call_strikes": oi.top_call_strikes,
+    }
+
+
+def run_position_review_with_data(
+    trade,
+    market_data,
+    technical,
+    oi,
+    chain,
+    check_slot: str = "MIDDAY",
+) -> "PositionReview":
+    """
+    Run a position review using data already fetched by the analysis pipeline.
+    check_slot defaults to MIDDAY (full correlated review); no session guard.
+    """
+    batch = batch_from_prefetched(
+        market_data,
+        technical,
+        oi,
+        chain,
+        include_technical=check_slot != "MORNING",
+    )
+    return _review_one_trade(trade, batch, check_slot)
 
 
 def _oi_at_strike(
@@ -461,19 +526,10 @@ def _evaluate_soft(
         if iv_today < (iv_entry - 15):
             codes.append("IV_RANK_DROP")
 
-    pcr_e = trade.pcr_at_entry
-    pcr_t = review.pcr_today
-    if pcr_e is not None and pcr_t is not None:
-        if abs(pcr_t - pcr_e) > 0.20:
-            codes.append("PCR_SHIFT")
-
     if review.call_oi_change_pct is not None and review.call_oi_change_pct > 40:
         codes.append("CALL_OI_BUILDING")
     if review.put_oi_change_pct is not None and review.put_oi_change_pct < -30:
         codes.append("PUT_WALL_COLLAPSING")
-
-    if review.max_pain_shift_pts is not None and abs(review.max_pain_shift_pts) > 200:
-        codes.append("MAX_PAIN_SHIFT")
 
     sc = review.short_call_delta_today or 0
     sp = review.short_put_delta_today or 0
@@ -626,6 +682,79 @@ def _finalize_review(
     return review
 
 
+def _finalize_from_correlated(
+    trade: TradeRecord,
+    review: PositionReview,
+    batch: dict[str, Any],
+    check_slot: str,
+    notes: List[str],
+) -> PositionReview:
+    """MIDDAY / EOD correlated evidence path (after hard rules passed)."""
+    run_correlated_midday_eod(trade, review, batch)
+    exit_signal, recommended, codes = map_action_to_exit(
+        review.action_category or "HOLD"
+    )
+
+    hard_codes: List[str] = []
+    soft_codes: List[str] = []
+    if exit_signal == "HARD_EXIT":
+        hard_codes = list(codes)
+    elif exit_signal == "SOFT_EXIT":
+        soft_codes = list(codes)
+    else:
+        soft_codes = []
+
+    if check_slot == "EOD":
+        hard_codes, soft_codes = _apply_slot_escalation(
+            hard_codes, soft_codes, check_slot, trade, review
+        )
+
+    extra_notes = list(notes)
+    if review.pending_greeks:
+        extra_notes.append("PENDING_GREEKS — submit Sensibull/greeks to complete theta scenarios.")
+    if review.evidence_list:
+        extra_notes.append("Evidence: " + "; ".join(review.evidence_list))
+
+    if hard_codes:
+        return _finalize_review(
+            trade, review, hard_codes, [], check_slot, extra_notes, use_llm=False
+        )
+
+    if exit_signal == "HOLD" or review.action_category == "HOLD":
+        review.exit_signal = "HOLD"
+        review.exit_reason_codes = review.evidence_list or []
+        review.recommended_action = "HOLD"
+        review.alert_detail = " | ".join(extra_notes) if extra_notes else None
+        if review.move_class == "NOISE":
+            review.reasoning = (
+                f"Move classified as NOISE (move_vs_expected={review.move_vs_expected}). "
+                "Hold — no meaningful change since last review."
+            )
+        else:
+            review.reasoning = "Correlated review: conditions stable — hold."
+        review.reasoning_skipped = True
+        review.review_status = "COMPLETED"
+        return review
+
+    review.exit_signal = "SOFT_EXIT"
+    review.exit_reason_codes = soft_codes
+    review.recommended_action = recommended
+    review.alert_detail = " | ".join(extra_notes) if extra_notes else None
+    review.review_status = "COMPLETED"
+
+    try:
+        review.reasoning = generate_correlated_reasoning(trade, review)
+        review.reasoning_skipped = False
+    except Exception as e:
+        logger.exception("Correlated LLM reasoning failed: %s", e)
+        review.reasoning = (
+            f"Action: {review.action_category} ({review.action_confidence}). "
+            f"Review recommended — see evidence on file."
+        )
+        review.reasoning_skipped = False
+    return review
+
+
 def _review_one_trade(
     trade: TradeRecord,
     batch: dict[str, Any],
@@ -645,16 +774,26 @@ def _review_one_trade(
     premium = None
     data_source = None
     greeks_extra: dict[str, Any] = {}
+    chain = batch.get("chain")
 
-    if trade.trade_type == "LIVE":
+    if chain is not None and not chain.empty:
+        fr = fetch_current_premium(trade, chain=chain)
+        if fr.get("current_premium") is not None:
+            premium = fr["current_premium"]
+            data_source = fr.get("data_source") or "chain_ltp"
+            greeks_extra = _greeks_from_live_chain(trade, chain)
+    elif trade.trade_type == "LIVE":
         fr = fetch_current_premium(trade)
         if fr.get("current_premium"):
             premium = fr["current_premium"]
             data_source = "broker"
-            chain = batch["chain"]
-            greeks_extra = _greeks_from_live_chain(trade, chain)
-    else:
+            if chain is not None and not chain.empty:
+                greeks_extra = _greeks_from_live_chain(trade, chain)
+
+    if premium is None and trade.trade_type == "PAPER":
         data_source = "pending"
+    elif premium is None and trade.trade_type == "LIVE":
+        data_source = data_source or "pending"
 
     review.data_source = data_source
     if premium is not None:
@@ -677,39 +816,27 @@ def _review_one_trade(
         review_store.upsert_review(review)
         return review
 
-    soft_spot_only = _evaluate_soft(trade, review, check_slot, notes)
-    needs_premium_soft = any(
-        c in soft_spot_only
-        for c in ("PROFIT_TARGET_HIT", "THETA_COLLAPSED", "PNL_DETERIORATION")
-    )
+    dte = review.dte_remaining if review.dte_remaining is not None else 0
+    spot = float(review.current_spot or trade.entry_spot)
+    move_vs, daily_expected, move_class = compute_move_metrics(trade, spot, dte)
+    apply_move_fields(review, move_vs, daily_expected, move_class)
 
-    if trade.trade_type == "PAPER" and premium is None:
-        review.review_status = "PENDING_INPUT"
-        review.exit_signal = None
-        review.recommended_action = None
-        review.exit_reason_codes = list(soft_spot_only)
-        review.alert_detail = " | ".join(notes) if notes else None
-        review.reasoning = (
-            "Paper trade — submit Sensibull snapshot or current premium to complete review."
-        )
-        review.reasoning_skipped = True
-        review_store.upsert_review(review)
-        return review
-
-    soft = _evaluate_soft(trade, review, check_slot, notes) if premium else soft_spot_only
-    hard, soft = _apply_slot_escalation(hard, soft, check_slot, trade, review)
-    if hard:
-        review = _finalize_review(trade, review, hard, [], check_slot, notes, use_llm=False)
-        review_store.upsert_review(review)
-        return review
-
-    use_llm = check_slot in ("MIDDAY", "EOD")
     if check_slot == "MORNING":
-        use_llm = False
+        if move_class == "NOISE":
+            notes.append(
+                f"Move NOISE (move_vs_expected={move_vs}) — soft signals suppressed."
+            )
+        review.exit_signal = "HOLD"
+        review.exit_reason_codes = []
+        review.recommended_action = "HOLD"
+        review.alert_detail = " | ".join(notes) if notes else None
+        review.reasoning = "Morning check: no hard exit triggers."
+        review.reasoning_skipped = True
+        review.review_status = "COMPLETED"
+        review_store.upsert_review(review)
+        return review
 
-    review = _finalize_review(
-        trade, review, [], soft, check_slot, notes, use_llm=use_llm
-    )
+    review = _finalize_from_correlated(trade, review, batch, check_slot, notes)
     review_store.upsert_review(review)
     return review
 
@@ -794,14 +921,22 @@ def complete_pending_review(
         review = _finalize_review(
             trade, pending, hard, [], pending.check_slot, notes, use_llm=False
         )
+    elif pending.check_slot == "MORNING":
+        spot = float(pending.current_spot or trade.entry_spot)
+        dte = pending.dte_remaining or 0
+        move_vs, daily_expected, move_class = compute_move_metrics(trade, spot, dte)
+        apply_move_fields(pending, move_vs, daily_expected, move_class)
+        if move_class == "NOISE":
+            notes.append(f"Move NOISE (move_vs_expected={move_vs}).")
+        pending.exit_signal = "HOLD"
+        pending.recommended_action = "HOLD"
+        pending.reasoning = "Morning check completed after premium input."
+        pending.review_status = "COMPLETED"
+        review = pending
     else:
-        soft = _evaluate_soft(trade, pending, pending.check_slot, notes)
-        hard, soft = _apply_slot_escalation(
-            hard, soft, pending.check_slot, trade, pending
-        )
-        use_llm = pending.check_slot in ("MIDDAY", "EOD")
-        review = _finalize_review(
-            trade, pending, hard, soft, pending.check_slot, notes, use_llm=use_llm
+        batch = fetch_review_market_data(include_technical=True)
+        review = _finalize_from_correlated(
+            trade, pending, batch, pending.check_slot, notes
         )
 
     review_store.upsert_review(review)
